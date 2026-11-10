@@ -114,7 +114,8 @@ DOCUMENTS: tuple[dict[str, str], ...] = (
         "source_type": "data_dictionary",
         "content": (
             "succeeded 表示支付成功终态，failed 表示明确失败终态；pending 表示仍在处理，不能"
-            "直接记作失败；cancelled 表示取消，需要按具体分析口径单独处理。响应分类 timeout、declined"
+            "直接记作失败；cancelled 表示取消，需要按具体分析口径单独处理。"
+            "响应分类 timeout、declined"
             "和 unavailable 用于定位原因，但不能仅凭状态标签确认上游责任。"
         ),
     },
@@ -161,7 +162,8 @@ DOCUMENTS: tuple[dict[str, str], ...] = (
         "title": "上海结算任务运行说明",
         "source_type": "service_runbook",
         "content": (
-            "上海日间结算任务由 settlement-worker 执行，与支付网关请求链路分开部署。调查支付失败时，"
+            "上海日间结算任务由 settlement-worker 执行，与支付网关请求链路分开部署。"
+            "调查支付失败时，"
             "结算任务变更可作为时间线背景，但只有发现共享依赖或资源争用证据后才应纳入可能原因。"
         ),
     },

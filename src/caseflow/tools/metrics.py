@@ -10,7 +10,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from caseflow.db import readonly_transaction
 from caseflow.models import PaymentAttempt
 from caseflow.schemas import GroupDimension, PaymentMetricsInput
-from caseflow.tools.common import ToolFailure, translate_database_error
+from caseflow.tools.common import translate_database_error
 
 DISPLAY_TZ = ZoneInfo("Asia/Shanghai")
 STATEMENT_RESULT_LIMIT = 50
@@ -33,7 +33,9 @@ def build_target_filter(region: str, start_at: datetime, end_at: datetime):
     )
 
 
-def _windows_for_baseline(start_at: datetime, end_at: datetime) -> tuple[str, list[tuple[datetime, datetime]]]:
+def _windows_for_baseline(
+    start_at: datetime, end_at: datetime
+) -> tuple[str, list[tuple[datetime, datetime]]]:
     duration = end_at - start_at
     if duration <= timedelta(days=1):
         windows = [

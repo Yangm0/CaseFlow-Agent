@@ -49,12 +49,11 @@ def _assert_known_caseflow_schema(engine: Engine) -> None:
     unknown = existing - CASEFLOW_TABLES
     if unknown:
         names = ", ".join(sorted(unknown)[:10])
-        raise ValueError(
-            "Refusing to seed a database with unrelated public tables: " + names
-        )
+        raise ValueError("Refusing to seed a database with unrelated public tables: " + names)
     if existing and "dataset_metadata" not in existing:
         raise ValueError(
-            "CaseFlow-named tables exist without its dataset marker; inspect the database before seeding."
+            "CaseFlow-named tables exist without its dataset marker; "
+            "inspect the database before seeding."
         )
     if "dataset_metadata" in existing:
         with engine.connect() as connection:
@@ -73,7 +72,8 @@ def seed_database(seed_engine: Engine) -> dict[str, int | str]:
     database_name = str(seed_engine.url.database or "")
     if database_name != "caseflow" and not database_name.endswith("_test"):
         raise ValueError(
-            "Refusing to seed an unrecognized database name; use caseflow or an isolated *_test database."
+            "Refusing to seed an unrecognized database name; use caseflow or "
+            "an isolated *_test database."
         )
     _assert_known_caseflow_schema(seed_engine)
     Base.metadata.create_all(seed_engine)
@@ -102,7 +102,9 @@ def seed_database(seed_engine: Engine) -> dict[str, int | str]:
             "change_events": connection.scalar(select(func.count()).select_from(ChangeEvent)),
             "incidents": connection.scalar(select(func.count()).select_from(Incident)),
             "documents": connection.scalar(select(func.count()).select_from(Document)),
-            "dataset_metadata": connection.scalar(select(func.count()).select_from(DatasetMetadata)),
+            "dataset_metadata": connection.scalar(
+                select(func.count()).select_from(DatasetMetadata)
+            ),
         }
     return {
         **{name: int(value or 0) for name, value in counts.items()},

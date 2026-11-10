@@ -46,7 +46,9 @@ def create_app(
                 else "credentials_missing"
             ),
         }
-        return JSONResponse(status_code=200 if database_ok and not live_blocked else 503, content=response)
+        return JSONResponse(
+            status_code=200 if database_ok and not live_blocked else 503, content=response
+        )
 
     @application.post("/api/v1/investigations", response_model=InvestigationReport)
     def investigate(request: InvestigationRequest):
@@ -61,11 +63,16 @@ def create_app(
                 document_evidence=[],
                 system_events=[],
                 hypotheses=[],
-                uncertainties=["请通过 OPENAI_API_KEY、OPENAI_MODEL 和可选 OPENAI_BASE_URL 配置 live 模式。"],
+                uncertainties=[
+                    "请通过 OPENAI_API_KEY、OPENAI_MODEL 和可选 OPENAI_BASE_URL 配置 live 模式。"
+                ],
                 recommendations=[],
                 tool_calls=[],
                 operations_executed=["未执行数据库或业务操作。"],
-                error={"code": "LLM_CREDENTIALS_MISSING", "message": "Live model credentials are not configured."},
+                error={
+                    "code": "LLM_CREDENTIALS_MISSING",
+                    "message": "Live model credentials are not configured.",
+                },
             )
         return app_agent.investigate(request.question)
 

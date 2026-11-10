@@ -1,6 +1,5 @@
 import hashlib
-from datetime import datetime, timedelta
-from typing import Any
+from datetime import timedelta
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -9,7 +8,7 @@ from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.dialects import postgresql
 
-from caseflow.agent import InvestigationAgent, OfflineFakeModel
+from caseflow.agent import InvestigationAgent, LiveLLM, OfflineFakeModel
 from caseflow.config import Settings
 from caseflow.data.synthetic import (
     ATTEMPTS_PER_REGION_PER_DAY,
@@ -27,6 +26,7 @@ from caseflow.data.synthetic import (
 from caseflow.db import make_engine
 from caseflow.models import PaymentAttempt
 from caseflow.schemas import (
+    ChangeEventsInput,
     EvidenceQuote,
     Hypothesis,
     PaymentMetricsInput,
@@ -59,11 +59,22 @@ def test_synthetic_dataset_is_deterministic_and_matches_ground_truth():
             if any(left <= row["attempted_at"] < right for left, right in windows):
                 baseline_valid += 1
                 baseline_failed += row["status"] == "failed"
-        return digest.hexdigest(), count, target_valid, target_failed, baseline_valid, baseline_failed
+        return (
+            digest.hexdigest(),
+            count,
+            target_valid,
+            target_failed,
+            baseline_valid,
+            baseline_failed,
+        )
 
     first = summarize()
     second = summarize()
-    expected_rows = (DATASET_AS_OF.date() - DATASET_START.date()).days * len(REGIONS) * ATTEMPTS_PER_REGION_PER_DAY
+    expected_rows = (
+        (DATASET_AS_OF.date() - DATASET_START.date()).days
+        * len(REGIONS)
+        * ATTEMPTS_PER_REGION_PER_DAY
+    )
     assert first == second
     assert first[1:] == (expected_rows, 50, 22, 330, 10)
     assert len(DOCUMENTS) == 18
@@ -77,9 +88,13 @@ def test_query_contract_rejects_unsafe_parameters_and_binds_half_open_window():
     end = "2025-01-21T12:00:00+08:00"
     malicious_region = "北京' OR 1=1 --"
     params = PaymentMetricsInput(region=malicious_region, start_at=start, end_at=end)
-    compiled = select(PaymentAttempt.attempt_id).where(
-        build_target_filter(params.region, params.start_at, params.end_at)
-    ).compile(dialect=postgresql.dialect())
+    assert PaymentMetricsInput(region="Beijing", start_at=start, end_at=end).region == "北京"
+    assert ChangeEventsInput(region="SHANGHAI", start_at=start, end_at=end).region == "上海"
+    compiled = (
+        select(PaymentAttempt.attempt_id)
+        .where(build_target_filter(params.region, params.start_at, params.end_at))
+        .compile(dialect=postgresql.dialect())
+    )
     assert ">=" in compiled.string and "<" in compiled.string
     assert malicious_region not in compiled.string
     bound_values = list(compiled.params.values())
@@ -98,8 +113,15 @@ def test_query_contract_rejects_unsafe_parameters_and_binds_half_open_window():
 
 def test_bm25_returns_verifiable_chinese_source_chunk():
     chunks = [
-        TextChunk("DOC-A", "chunk-000", "网关超时手册", "网关超时通常与上游响应有关，应检查健康状态和重试。"),
-        TextChunk("DOC-B", "chunk-000", "结算说明", "结算任务按批次核对账单，不参与支付网关请求链路。"),
+        TextChunk(
+            "DOC-A",
+            "chunk-000",
+            "网关超时手册",
+            "网关超时通常与上游响应有关，应检查健康状态和重试。",
+        ),
+        TextChunk(
+            "DOC-B", "chunk-000", "结算说明", "结算任务按批次核对账单，不参与支付网关请求链路。"
+        ),
         TextChunk("DOC-C", "chunk-000", "账户安全说明", "账户资料应按访问控制规则保管并定期复核。"),
     ]
     results = rank_chunks("上游网关超时重试", chunks, top_k=2)
@@ -109,6 +131,31 @@ def test_bm25_returns_verifiable_chinese_source_chunk():
 
 
 def test_langgraph_dynamic_loop_stops_at_budget():
+    metric_window = {
+        "tool_name": "query_payment_metrics",
+        "output": {
+            "query_parameters": {
+                "region": "北京",
+                "start_at": "2025-01-21T09:00:00+08:00",
+                "end_at": "2025-01-21T12:00:00+08:00",
+            }
+        },
+    }
+    related_args = InvestigationAgent._related_change_arguments(
+        {
+            "region": "Beijing",
+            "start_at": "2025-01-21T09:00:00+08:00",
+            "end_at": "2025-01-21T12:00:00+08:00",
+        },
+        [metric_window],
+        "判断失败率是否异常并分析原因",
+    )
+    assert related_args["start_at"] == "2025-01-21T07:00:00+08:00"
+    exact_args = InvestigationAgent._related_change_arguments(
+        related_args, [metric_window], "仅查询窗口内的变更"
+    )
+    assert exact_args == related_args
+
     fake = OfflineFakeModel()
     question = "北京 2025-01-21 09:00 到 12:00 支付失败率异常吗？"
     first = fake.decide([], question, [])
@@ -116,7 +163,11 @@ def test_langgraph_dynamic_loop_stops_at_budget():
     metric = {
         "tool_name": "query_payment_metrics",
         "output": {
-            "query_parameters": {"region": "北京", "start_at": "2025-01-21T09:00:00+08:00", "end_at": "2025-01-21T12:00:00+08:00"},
+            "query_parameters": {
+                "region": "北京",
+                "start_at": "2025-01-21T09:00:00+08:00",
+                "end_at": "2025-01-21T12:00:00+08:00",
+            },
             "metrics": {"valid_attempts": 50, "failure_rate": 0.44},
             "baseline": {"failure_rate": 10 / 330},
         },
@@ -131,15 +182,73 @@ def test_langgraph_dynamic_loop_stops_at_budget():
 
     class RepeatingModel:
         def decide(self, messages, question, tool_results):
-            return AIMessage(content="", tool_calls=[{"name": "search_knowledge", "args": {"query": "支付超时"}, "id": "repeat", "type": "tool_call"}])
+            return AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "search_knowledge",
+                        "args": {"query": "支付超时"},
+                        "id": "repeat",
+                        "type": "tool_call",
+                    }
+                ],
+            )
 
         def synthesize(self, question, evidence):
             return SynthesisDraft()
 
-    tool = StructuredTool.from_function(func=search, name="search_knowledge", description="test tool")
-    result = InvestigationAgent({"search_knowledge": tool}, RepeatingModel(), "offline_test", max_tool_calls=1).investigate("查支付超时")
+    tool = StructuredTool.from_function(
+        func=search, name="search_knowledge", description="test tool"
+    )
+    result = InvestigationAgent(
+        {"search_knowledge": tool}, RepeatingModel(), "offline_test", max_tool_calls=1
+    ).investigate("查支付超时")
     assert calls["count"] == 1
     assert result.status == "partial" and result.error["code"] == "TOOL_CALL_BUDGET_EXCEEDED"
+    assert len(result.model_calls) == 2
+    assert not result.token_usage.available and result.token_usage.total_tokens is None
+
+    model_budgeted = InvestigationAgent(
+        {"search_knowledge": tool},
+        RepeatingModel(),
+        "offline_test",
+        max_tool_calls=2,
+        max_model_calls=1,
+    ).investigate("查支付超时")
+    assert model_budgeted.status == "partial"
+    assert model_budgeted.error["code"] == "MODEL_CALL_BUDGET_EXCEEDED"
+    assert len(model_budgeted.model_calls) == 1 and len(model_budgeted.tool_calls) == 1
+    calls["count"] = 0
+
+    class DuplicateModel:
+        def __init__(self):
+            self.turn = 0
+
+        def decide(self, messages, question, tool_results):
+            self.turn += 1
+            if self.turn < 3:
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_knowledge",
+                            "args": {"query": "支付超时"},
+                            "id": f"duplicate-{self.turn}",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            return AIMessage(content="")
+
+        def synthesize(self, question, evidence):
+            return SynthesisDraft()
+
+    duplicate = InvestigationAgent(
+        {"search_knowledge": tool}, DuplicateModel(), "offline_test", max_tool_calls=3
+    ).investigate("查支付超时")
+    assert calls["count"] == 1
+    assert duplicate.tool_calls[1].status == "skipped"
+    assert duplicate.tool_calls[1].error_code == "DUPLICATE_TOOL_CALL"
 
 
 def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
@@ -151,35 +260,152 @@ def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
         def decide(self, messages, question, tool_results):
             self.turn += 1
             if self.turn == 1:
-                return AIMessage(content="", tool_calls=[{"name": "search_knowledge", "args": {"query": "网关超时"}, "id": "one", "type": "tool_call"}])
+                return AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "search_knowledge",
+                            "args": {"query": "网关超时"},
+                            "id": "one",
+                            "type": "tool_call",
+                        }
+                    ],
+                )
             return AIMessage(content="done")
 
         def synthesize(self, question, evidence):
             return self.draft
 
     def timeout_tool(query: str):
-        raise ToolFailure("DATABASE_TIMEOUT", "The read-only database query exceeded its time limit.")
+        raise ToolFailure(
+            "DATABASE_TIMEOUT", "The read-only database query exceeded its time limit."
+        )
 
-    failing = StructuredTool.from_function(func=timeout_tool, name="search_knowledge", description="test failure")
-    failed = InvestigationAgent({"search_knowledge": failing}, OneCallModel(), "offline_test").investigate("查询文档")
+    failing = StructuredTool.from_function(
+        func=timeout_tool, name="search_knowledge", description="test failure"
+    )
+    failed = InvestigationAgent(
+        {"search_knowledge": failing}, OneCallModel(), "offline_test"
+    ).investigate("查询文档")
     assert failed.status == "failed" and failed.tool_calls[0].error_code == "DATABASE_TIMEOUT"
 
-    doc = {"evidence_id": "KNOW-DOC-A-chunk-000", "document_id": "DOC-A", "chunk_id": "chunk-000", "title": "网关手册", "text": "网关超时需要核对上游响应。", "score": 1.0}
+    doc = {
+        "evidence_id": "KNOW-DOC-A-chunk-000",
+        "document_id": "DOC-A",
+        "chunk_id": "chunk-000",
+        "title": "网关手册",
+        "text": "网关超时需要核对上游响应。",
+        "score": 1.0,
+    }
 
     def good_search(query: str):
         return {"search_id": "S", "results": [doc]}
 
-    draft = SynthesisDraft(hypotheses=[Hypothesis(statement="根因已经确认。", citations=[EvidenceQuote(evidence_id="MISSING", quote="没有来源的引用")])])
-    good = StructuredTool.from_function(func=good_search, name="search_knowledge", description="test citation")
-    cited = InvestigationAgent({"search_knowledge": good}, OneCallModel(draft), "offline_test").investigate("查询文档")
+    draft = SynthesisDraft(
+        hypotheses=[
+            Hypothesis(
+                statement="根因已经确认。",
+                citations=[EvidenceQuote(evidence_id="MISSING", quote="没有来源的引用")],
+            )
+        ]
+    )
+    good = StructuredTool.from_function(
+        func=good_search, name="search_knowledge", description="test citation"
+    )
+    cited = InvestigationAgent(
+        {"search_knowledge": good}, OneCallModel(draft), "offline_test"
+    ).investigate("查询文档")
     assert not cited.hypotheses and any("引用 ID" in item for item in cited.uncertainties)
+    assert cited.citation_validation.citations_rejected == 1
+    assert cited.citation_validation.hypotheses_kept == 0
+
+    class DirectAnswerModel:
+        def decide(self, messages, question, tool_results):
+            return AIMessage(
+                content=[
+                    {
+                        "type": "text",
+                        "text": "1. 可查询支付聚合指标。\n2. 可查询变更事故记录和知识文档。",
+                    }
+                ]
+            )
+
+        def synthesize(self, question, evidence):
+            raise AssertionError("direct answers do not require synthesis")
+
+    direct = InvestigationAgent({}, DirectAnswerModel(), "offline_test").investigate(
+        "不查询业务数据，请简要说明这个 Agent 能执行哪些只读调查操作。"
+    )
+    assert direct.status == "completed" and direct.direct_answer
+    assert any("未调用业务工具" in item for item in direct.uncertainties)
+    assert not direct.tool_calls and len(direct.model_calls) == 1
+
+    class NumericDirectAnswerModel:
+        def decide(self, messages, question, tool_results):
+            return AIMessage(content="当前支付失败率为 44%。")
+
+        def synthesize(self, question, evidence):
+            raise AssertionError("direct answers do not require synthesis")
+
+    numeric_direct = InvestigationAgent(
+        {},
+        NumericDirectAnswerModel(),
+        "offline_test",
+    ).investigate("北京 2025-01-21 09:00 到 12:00 支付失败率是多少？")
+    assert numeric_direct.status == "failed" and numeric_direct.direct_answer is None
+
+    unverified_capability = InvestigationAgent(
+        {}, NumericDirectAnswerModel(), "offline_test"
+    ).investigate("不查询业务数据，简要说明 Agent 能执行哪些只读调查操作。")
+    assert unverified_capability.status == "failed" and unverified_capability.direct_answer is None
+
+    live = LiveLLM.__new__(LiveLLM)
+    live.model_name = "test-model"
+    live.structured_output_method = "json_schema"
+    methods = []
+
+    class StructuredRunner:
+        def __init__(self, method):
+            self.method = method
+
+        def invoke(self, messages):
+            if self.method == "json_schema":
+                raise RuntimeError("unsupported structured output")
+            raw = AIMessage(
+                content="{}",
+                usage_metadata={"input_tokens": 9, "output_tokens": 3, "total_tokens": 12},
+            )
+            return {"raw": raw, "parsed": SynthesisDraft()}
+
+    class StructuredModel:
+        def with_structured_output(self, schema, method, include_raw):
+            assert schema is SynthesisDraft and include_raw is True
+            methods.append(method)
+            return StructuredRunner(method)
+
+    live.synthesis_model = StructuredModel()
+    structured = live.synthesize_outcome("查询证据", [])
+    assert structured.error_code is None and isinstance(structured.value, SynthesisDraft)
+    assert methods == ["json_schema", "function_calling"]
+    assert [item["error_code"] for item in structured.traces] == [
+        "MODEL_STRUCTURED_OUTPUT_UNSUPPORTED",
+        None,
+    ]
+    assert structured.traces[-1]["total_tokens"] == 12
+    methods.clear()
+    limited = live.synthesize_outcome("查询证据", [], max_attempts=1)
+    assert limited.error_code == "MODEL_STRUCTURED_OUTPUT_UNSUPPORTED"
+    assert methods == ["json_schema"] and len(limited.traces) == 1
 
     from fastapi.testclient import TestClient
+
     from caseflow.api import create_app
 
     engine = make_engine("postgresql+psycopg://caseflow_app:unused@127.0.0.1:5432/caseflow_test")
     try:
-        client = TestClient(create_app(settings=Settings(mode="live", openai_api_key=None), engine=engine))
+        client = TestClient(
+            create_app(settings=Settings(mode="live", openai_api_key=None), engine=engine)
+        )
         response = client.post("/api/v1/investigations", json={"question": "调查支付异常"})
         assert response.status_code == 200
         assert response.json()["status"] == "blocked"

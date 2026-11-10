@@ -13,7 +13,9 @@ def translate_database_error(error: SQLAlchemyError) -> ToolFailure:
     if isinstance(error, OperationalError) and (
         "statement timeout" in detail or "canceling statement" in detail
     ):
-        return ToolFailure("DATABASE_TIMEOUT", "The read-only database query exceeded its time limit.")
+        return ToolFailure(
+            "DATABASE_TIMEOUT", "The read-only database query exceeded its time limit."
+        )
     if isinstance(error, DBAPIError) and not error.connection_invalidated:
         return ToolFailure("DATABASE_QUERY_FAILED", "The read-only database query failed.")
     return ToolFailure("DATABASE_UNAVAILABLE", "The PostgreSQL database is unavailable.")

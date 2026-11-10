@@ -97,6 +97,7 @@ class ChangeEventsService:
             "result_limit": RESULT_LIMIT,
             "events": events,
             "causality_note": (
-                "Temporal overlap is an investigation lead; it does not establish that a change caused an incident."
+                "Temporal overlap is an investigation lead; it does not establish that a change "
+                "caused an incident."
             ),
         }

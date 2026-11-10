@@ -1,4 +1,4 @@
-# CaseFlow Agent V1-A
+# CaseFlow Agent V1-B
 
 CaseFlow is a small, reviewable payment-incident investigation agent. It connects a FastAPI request to read-only PostgreSQL queries, Chinese BM25 retrieval, and an explicit LangGraph tool loop. It is intended as an interviewable engineering project, not a production payment control plane.
 
@@ -6,14 +6,17 @@ CaseFlow is a small, reviewable payment-incident investigation agent. It connect
 
 Verified on Windows with Python 3.13.2 on 2026-11-10:
 
-- Installed `.[dev]` into the existing `.venv` through the active v2rayN proxy (`127.0.0.1:10808`). FastAPI, LangGraph, SQLAlchemy, psycopg, jieba, and pytest all import successfully.
-- Docker Desktop 4.99.0 is running with Docker Engine 29.9.3, Compose 5.7.0, and its WSL 2 backend. PostgreSQL 17.11 is healthy on `127.0.0.1:5432`.
-- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, 4 incidents, and 12 metadata rows. Re-seeding `caseflow` leaves those counts unchanged. The application role can select but cannot insert, update, or delete; the seed role can create objects in the project schema.
-- Pytest collected 8 tests and all 8 passed, including the PostgreSQL integration checks and offline FastAPI end-to-end investigation. No tests were skipped.
-- A real offline API request returned HTTP 200 and `completed`. It called `query_payment_metrics`, `query_change_events`, and `search_knowledge` in that order. PostgreSQL returned 22/50 failed attempts (44%) versus 10/330 (3.03%) across the seven prior matching windows. The report included related change and incident records, five BM25 passages, and a low-confidence route/retry hypothesis with source-checked quotations; it states that the evidence does not prove causation.
-- This is offline engineering acceptance using the deterministic fake model. No paid or live LLM request was made, and it is not a live model quality evaluation.
+- The existing `.venv` has the project and development dependencies installed; FastAPI, LangGraph, SQLAlchemy, psycopg, jieba, and pytest import successfully. Package installation used the active v2rayN proxy without changing system-wide proxy settings.
+- Docker Desktop is running with Docker Engine 29.9.3, Compose 5.7.0, and its WSL 2 backend. PostgreSQL 17 is healthy on `127.0.0.1:5432`. The Docker CLI binary is installed in the current user's Docker Desktop directory but is not on this PowerShell session's PATH.
+- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, and 4 incidents. The test database contains no leftover evaluation-injection document. The application role can select but cannot insert, update, or delete.
+- Ruff checks pass, pytest collects exactly 8 tests, and all 8 pass against the real PostgreSQL test database.
+- A real live API smoke completed with `nvidia/nemotron-3.5-super-vl:free` through OpenRouter. It used two decision calls followed by one JSON-schema synthesis call. Tool order was `query_payment_metrics` → `query_change_events` → `search_knowledge`; all three succeeded.
+- The smoke queried Beijing on 2025-01-21 09:00–12:00: 22/50 failed (44.00%) versus 10/330 (3.03%) over seven prior matching windows. The related change at 08:52 and incident at 09:07 were returned, along with five BM25 passages. The report treats timing as a clue, not proof of cause. It retained one low-confidence hypothesis with two source-checked quotations and removed five of seven proposed citations.
+- A four-case live comparison completed for Direct LLM, PostgreSQL BM25-RAG, and the full Agent. Completion was 4/4 in each condition; full Agent tool selection was exact in 4/4 cases and all attempted tool calls executed successfully. Exact argument checks passed for the separately captured full investigation. The heuristic numeric screen found no unsupported numeric tokens; it is not a semantic fact checker. Citation candidate validity in the full Agent was 46.7%; normal and missing-evidence cases had rejected citations, which remain a known quality issue.
+- A six-query BM25 retrieval evaluation measured mean Recall@5 0.722 and MRR 1.000. Labels were set independently of rankings; every query's first result was relevant.
+- The live smoke and evaluation used only synthetic records in `caseflow_test`. The model route was checked as a zero-price `:free` route at run time; pricing and quotas can change. No paid model API was called.
 
-## V1-A scope
+## V1-B engineering scope
 
 - PostgreSQL tables for synthetic payment attempts, service changes, incidents, documents, and dataset metadata.
 - Parameterized SQLAlchemy aggregate tools with bounded time windows, allow-listed grouping dimensions, statement timeouts, result caps, and database read-only permissions.
@@ -23,7 +26,7 @@ Verified on Windows with Python 3.13.2 on 2026-11-10:
 - `live` uses an OpenAI-compatible Function Calling API through `langchain-openai`; credentials and endpoint settings come from environment variables.
 - FastAPI endpoints: `GET /health` and `POST /api/v1/investigations`.
 
-V1-A deliberately excludes writes, auto-remediation, pgvector, MCP, Redis, multi-agent coordination, web UI, and persistent checkpoints.
+V1-B deliberately excludes writes, auto-remediation, pgvector, MCP, Redis, multi-agent coordination, web UI, and persistent checkpoints.
 
 ## Architecture and request path
 
@@ -70,7 +73,12 @@ $env:TMP = $env:TEMP
 The sample `.env` values are for local development only. Change passwords before exposing PostgreSQL beyond loopback. Compose provisions a `caseflow` development database and an isolated `caseflow_test` database, with separate `caseflow_app` (read-only) and `caseflow_seed` (schema/seed) roles.
 
 ```powershell
-docker compose up -d postgres
+if (Get-Command docker -ErrorAction SilentlyContinue) {
+    docker compose up -d postgres
+} else {
+    $docker = Join-Path $env:LOCALAPPDATA 'Programs\DockerDesktop\resources\bin\docker.exe'
+    & $docker compose up -d postgres
+}
 python scripts/seed_database.py
 ```
 
@@ -96,9 +104,21 @@ This exercises real SQL and BM25 against the local PostgreSQL instance, but the 
 
 ## Live model run
 
-Set `CASEFLOW_MODE=live`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `OPENAI_BASE_URL` in `.env`, then restart the API. The model must support tool/function calling and structured output. No credentials are bundled; without a key, `/health` reports degraded status and investigation requests return `blocked` with `LLM_CREDENTIALS_MISSING`. No paid service is opened automatically.
+`live` uses an OpenAI-compatible API through `langchain-openai`. Function calling is enabled with automatic tool selection; the agent passes the validated tool schemas, returns tool results to the model, and can continue the investigation before synthesis. Structured output explicitly selects `json_schema` and retries once with `function_calling` only when the provider rejects the configured method. Stage-specific timeouts, token limits, model-call and tool-call caps, safe error codes, token usage, and elapsed time are recorded in the response trace.
 
-The API response does not include the key or configured base URL. Tool-call traces contain tool names, validated arguments, timings, outcomes, and evidence IDs; they do not log model credentials or raw SQL.
+For a local run, configure `CASEFLOW_MODE=live`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` in the ignored `.env` file or the current PowerShell process. The smoke and evaluation scripts refuse non-`:free` models and non-OpenRouter endpoints; they also require the isolated `caseflow_test` database. The free model route used for this verification was `nvidia/nemotron-3.5-super-vl:free`. Recheck provider pricing and quota before each run because they can change. The route verified for this run was listed as free by [OpenRouter's model page](https://openrouter.ai/nvidia/nemotron-3.5-super-vl%3Afree); see [current free-route limits](https://openrouter.ai/collections/free-models).
+
+```powershell
+$env:CASEFLOW_MODE = 'live'
+$env:OPENAI_BASE_URL = 'https://openrouter.ai/api/v1'
+$env:OPENAI_MODEL = 'nvidia/nemotron-3.5-super-vl:free'
+$env:OPENAI_API_KEY = '<your local test key>'
+.\.venv\Scripts\python.exe scripts\live_smoke.py --confirm-zero-cost-free-endpoint
+```
+
+The script calls FastAPI through `TestClient`, not a production service. It connects only to `TEST_DATABASE_URL`, checks the configured database name, refuses the request unless the `:free` route is explicitly confirmed, and writes a redacted local trace to ignored `.tmp/`. Never put a real key in README, source control, or a shared trace.
+
+The verified run used synthetic data only. OpenRouter's current free-route terms and model pricing should be rechecked before using any other data or repeating an evaluation. The configured API key and base URL are not returned in reports.
 
 ## Tests
 
@@ -112,16 +132,35 @@ Integration coverage includes database connectivity, deterministic import counts
 
 ## Evaluation cases
 
-`evals/v1a_cases.json` contains 20 categorized reference tasks covering normal/no-anomaly investigations, missing evidence, invalid parameters, security, tool failures/timeouts, citation validation, and uncertainty. `evals/ground_truth.json` is for evaluator use only and is not part of the agent's runtime context. V1-A includes the cases and their references; it does not claim model accuracy or measured quality improvements.
+`evals/v1a_cases.json` contains the existing reference tasks; `evals/v1b_cases.json` adds direct no-tool and adversarial-document cases. `evals/ground_truth.json` is evaluator-only and is never imported into the Agent or tool prompts. The live evaluator compares Direct LLM, PostgreSQL BM25-RAG, and the full Agent on the same selected questions, and reports completion, tool selection, schema-compatible call execution, checked argument matches, citation IDs, heuristic unsupported numeric tokens, latency, tokens, and bad cases. Completion means the condition returned a non-empty answer or completed report; it is not an answer-correctness score.
 
-## Known limits and V1-B boundary
+Run the independent retrieval evaluation against the real test database:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_retrieval.py
+```
+
+Run the bounded live comparison only after confirming current route pricing and quota:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\evaluate_agent.py `
+  --case normal-01 `
+  --case missing-evidence-01 `
+  --case direct-no-tool-01 `
+  --case prompt-injection-01 `
+  --confirm-zero-cost-free-endpoint
+```
+
+For any case involving the adversarial document, the runner inserts a uniquely named temporary document into `caseflow_test` and removes exactly that row in `finally`. Evaluation outputs are written under ignored `.tmp/`. The four-case live sample is an engineering check, not a statistically representative model benchmark. In the measured run, Direct LLM and BM25-RAG each completed 4/4 cases; the full Agent completed 4/4 and selected the expected tool sequence in 4/4. The heuristic numeric scan found zero unmatched numeric tokens. Exact argument matching was scored on one full investigation and passed 1/1. The full Agent citation candidate validity was 46.7%, so it is not yet a strong citation-quality result. The retrieval score applies only to the six manually labeled synthetic queries.
+
+## Known limits and V1-C boundary
 
 - PostgreSQL and live LLM acceptance depend on local Docker/PostgreSQL and user-provided model credentials.
-- The BM25 index is built from the current PostgreSQL document rows per search request; there is no persistent/vector index.
+- BM25 remains the retrieval baseline. Its tokenized document corpus and rank index are cached in process and refreshed when document count or latest update time changes; there is no persistent or vector index.
 - The offline fake is a deterministic test driver with limited question parsing, not an LLM substitute.
 - Synthetic payments do not include card/channel response codes, latency percentiles, customer details, or production-quality alert streams.
-- Citation IDs and exact quote spans are verified, but semantic entailment between a quote and a generated hypothesis is not fully automatic.
-- The elapsed-time budget is checked between nodes; an in-flight LLM request can finish near its configured request timeout before the next check stops the graph. Hard call caps and PostgreSQL statement timeouts remain enforced.
-- No recovery action or payment write path exists.
+- Citation IDs and exact quote spans are verified, but quote matching does not prove semantic entailment. The live comparison still found rejected citations; improve quote selection and citation supervision before presenting citation quality as reliable.
+- The elapsed-time budget is checked between nodes; an in-flight LLM request can finish near its configured request timeout before the next check stops the graph. The implementation does not claim hard cancellation of synchronous provider calls.
+- No recovery action or payment write path exists. pgvector, embedding retrieval, MCP, Redis, multi-agent coordination, web UI, and persistent checkpoints remain out of scope for this V1-B branch.
 
-V1-B can add a reproducible held-out evaluation runner and richer response-code/latency evidence after V1-A's PostgreSQL-backed path is verified. pgvector, MCP, Redis, and multi-agent orchestration should remain separate decisions rather than prerequisites for that boundary.
+A V1-C iteration should first improve citation validity and add a larger held-out evaluation set. Only then compare an embedding or hybrid retriever against the same BM25 relevance labels. Keep any write or remediation path outside this read-only investigation Agent.
