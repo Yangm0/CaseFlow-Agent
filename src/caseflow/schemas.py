@@ -183,6 +183,8 @@ class DocumentEvidence(BaseModel):
     title: str
     text: str
     score: float
+    retrieval_mode: Literal["bm25_only", "hybrid"] = "bm25_only"
+    retrieval_sources: list[Literal["bm25", "pgvector"]] = Field(default_factory=list)
 
 
 class ChangeEvidence(BaseModel):

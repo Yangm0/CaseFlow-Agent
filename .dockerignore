@@ -1,0 +1,17 @@
+.git/
+.venv/
+.tmp/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+**/__pycache__/
+.env
+.env.*
+*.log
+postgres_data/
+data/generated/
+tests/
+evals/
+scripts/
+migrations/
+docker/

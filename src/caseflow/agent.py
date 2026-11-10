@@ -3,7 +3,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Literal, TypedDict
+from typing import Annotated, Any, Literal, TypedDict
 from urllib.parse import urlparse
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.tools import StructuredTool
 from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
 from pydantic import ValidationError
 
 from caseflow.config import Settings
@@ -63,6 +64,8 @@ Do not reveal hidden reasoning; include only concise conclusions supported by th
 
 class AgentState(TypedDict, total=False):
     question: str
+    investigation_id: str
+    trace_id: str
     messages: list[BaseMessage]
     pending_tool_calls: list[dict[str, Any]]
     tool_results: list[dict[str, Any]]
@@ -77,6 +80,8 @@ class AgentState(TypedDict, total=False):
     status: Literal["completed", "partial", "failed", "blocked"]
     error: dict[str, str] | None
     report: dict[str, Any]
+    history: Annotated[list[BaseMessage], add_messages]
+    thread_id: str
 
 
 @dataclass
@@ -592,6 +597,8 @@ class InvestigationAgent:
         max_tool_calls: int = 8,
         max_agent_seconds: float = 25,
         max_model_calls: int = 10,
+        checkpointer: Any | None = None,
+        event_sink: Any | None = None,
     ):
         self.tools = tools
         self.model = model
@@ -599,6 +606,8 @@ class InvestigationAgent:
         self.max_tool_calls = max_tool_calls
         self.max_agent_seconds = max_agent_seconds
         self.max_model_calls = max_model_calls
+        self.checkpointer = checkpointer
+        self.event_sink = event_sink
         graph = StateGraph(AgentState)
         graph.add_node("llm_decision", self._llm_decision)
         graph.add_node("execute_tools", self._execute_tools)
@@ -611,17 +620,32 @@ class InvestigationAgent:
         )
         graph.add_edge("execute_tools", "llm_decision")
         graph.add_edge("finalize", END)
-        self.graph = graph.compile()
+        self.graph = graph.compile(checkpointer=checkpointer)
 
-    def investigate(self, question: str) -> InvestigationReport:
+    def _emit(self, state: AgentState, event: str, payload: dict[str, Any]) -> None:
+        thread_id = state.get("thread_id")
+        if thread_id and self.event_sink is not None:
+            self.event_sink.publish(thread_id, event, payload)
+
+    def investigate(self, question: str, thread_id: str | None = None) -> InvestigationReport:
         investigation_id = str(uuid4())
         trace_id = str(uuid4())
+        configurable = {"thread_id": thread_id} if thread_id and self.checkpointer else None
+        prior_history: list[BaseMessage] = []
+        if configurable:
+            snapshot = self.graph.get_state({"configurable": configurable})
+            prior_history = list(snapshot.values.get("history", [])) if snapshot.values else []
         state: AgentState = {
             "question": question,
+            "investigation_id": investigation_id,
+            "trace_id": trace_id,
             "messages": [
                 SystemMessage(content=AGENT_SYSTEM_PROMPT),
+                *prior_history,
                 HumanMessage(content=question),
             ],
+            "history": [HumanMessage(content=question)],
+            "thread_id": thread_id or "",
             "pending_tool_calls": [],
             "tool_results": [],
             "tool_traces": [],
@@ -633,7 +657,9 @@ class InvestigationAgent:
             "status": "completed",
             "error": None,
         }
-        final_state = self.graph.invoke(state)
+        self._emit(state, "status", {"status": "running"})
+        invoke_config = {"configurable": configurable} if configurable else None
+        final_state = self.graph.invoke(state, config=invoke_config)
         report_data = final_state.get("report")
         if not report_data:
             report_data = self._fallback_report(
@@ -646,6 +672,50 @@ class InvestigationAgent:
         report_data["investigation_id"] = investigation_id
         report_data["trace_id"] = trace_id
         report_data["mode"] = self.mode
+        if configurable:
+            self.graph.update_state(invoke_config, {"report": report_data})
+        self._emit(
+            {**final_state, "thread_id": thread_id or ""},
+            "completed",
+            {"status": report_data.get("status"), "investigation_id": investigation_id},
+        )
+        return InvestigationReport.model_validate(report_data)
+
+    def resume(self, thread_id: str) -> InvestigationReport:
+        if self.checkpointer is None:
+            raise ValueError("Persistent thread checkpointing is not configured.")
+        configurable = {"thread_id": thread_id}
+        invoke_config = {"configurable": configurable}
+        snapshot = self.graph.get_state(invoke_config)
+        if not snapshot or not snapshot.values:
+            raise ValueError("The thread has no saved investigation to resume.")
+        if not snapshot.next:
+            report = snapshot.values.get("report")
+            if report:
+                return InvestigationReport.model_validate(report)
+            raise ValueError("The thread has no interrupted investigation to resume.")
+
+        self.graph.update_state(invoke_config, {"started_at": time.monotonic()})
+        self._emit({"thread_id": thread_id}, "status", {"status": "resuming"})
+        final_state = self.graph.invoke(None, config=invoke_config)
+        report_data = final_state.get("report")
+        if not report_data:
+            raise RuntimeError("The saved investigation resumed without producing a report.")
+        report_data = dict(report_data)
+        report_data["investigation_id"] = str(
+            final_state.get("investigation_id") or report_data.get("investigation_id")
+        )
+        report_data["trace_id"] = str(final_state.get("trace_id") or report_data.get("trace_id"))
+        report_data["mode"] = self.mode
+        self.graph.update_state(invoke_config, {"report": report_data})
+        self._emit(
+            {"thread_id": thread_id},
+            "completed",
+            {
+                "status": report_data.get("status"),
+                "investigation_id": report_data["investigation_id"],
+            },
+        )
         return InvestigationReport.model_validate(report_data)
 
     def _call_model(
@@ -734,6 +804,7 @@ class InvestigationAgent:
         return bool(re.search(r"\d|[%￥¥]", without_list_markers))
 
     def _llm_decision(self, state: AgentState) -> dict[str, Any]:
+        self._emit(state, "agent_step", {"stage": "decision"})
         elapsed = time.monotonic() - state["started_at"]
         if elapsed >= self.max_agent_seconds:
             return self._budget_failure(state, "AGENT_TIME_BUDGET_EXCEEDED")
@@ -892,6 +963,7 @@ class InvestigationAgent:
                 args = self._related_change_arguments(args, results, state["question"])
 
             started = time.monotonic()
+            self._emit(state, "tool_start", {"tool_name": name, "arguments": args})
             try:
                 if name not in self.tools:
                     raise ToolFailure("UNKNOWN_TOOL", "The requested tool is not available.")
@@ -952,6 +1024,17 @@ class InvestigationAgent:
             results.append(tool_result)
             tool_messages.append(
                 ToolMessage(content=result_content, tool_call_id=call_id, name=name or "unknown")
+            )
+            self._emit(
+                state,
+                "tool_result",
+                {
+                    "tool_name": name,
+                    "status": trace.status,
+                    "elapsed_ms": trace.elapsed_ms,
+                    "evidence_ids": trace.evidence_ids,
+                    "error_code": trace.error_code,
+                },
             )
             tool_call_count += 1
 
@@ -1140,7 +1223,16 @@ class InvestigationAgent:
 
         state = {**state, "citation_validation": citation_stats}
         report = self._compile_report(state, valid_hypotheses, uncertainties, recommendations)
-        return {"report": report}
+        evidence_ids = [
+            str(item["evidence_id"])
+            for item in self._synthesis_evidence(state.get("tool_results", []))
+            if item.get("evidence_id")
+        ]
+        self._emit(state, "evidence", {"evidence_ids": evidence_ids})
+        return {
+            "report": report,
+            "history": [AIMessage(content=str(report.get("summary", "调查完成")))],
+        }
 
     def _route_after_decision(self, state: AgentState) -> str:
         if state.get("pending_tool_calls") and state.get("status") not in ("failed", "blocked"):
@@ -1208,8 +1300,8 @@ class InvestigationAgent:
             unavailable_calls=unavailable_calls,
         )
         return {
-            "investigation_id": "pending",
-            "trace_id": "pending",
+            "investigation_id": state.get("investigation_id", "pending"),
+            "trace_id": state.get("trace_id", "pending"),
             "mode": self.mode,
             "status": status,
             "summary": summary,
@@ -1527,6 +1619,8 @@ def build_agent(
     settings: Settings,
     tools: dict[str, StructuredTool],
     model_override: Any | None = None,
+    checkpointer: Any | None = None,
+    event_sink: Any | None = None,
 ) -> InvestigationAgent | None:
     if model_override is not None:
         model = model_override
@@ -1543,4 +1637,6 @@ def build_agent(
         max_tool_calls=settings.max_tool_calls,
         max_agent_seconds=settings.max_agent_seconds,
         max_model_calls=settings.max_model_calls,
+        checkpointer=checkpointer,
+        event_sink=event_sink,
     )

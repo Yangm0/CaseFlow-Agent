@@ -24,6 +24,38 @@ class Settings(BaseSettings):
     test_seed_database_url: str | None = Field(
         default=None, validation_alias="TEST_SEED_DATABASE_URL"
     )
+    checkpoint_database_url: str | None = Field(
+        default=None, validation_alias="CHECKPOINT_DATABASE_URL"
+    )
+    test_checkpoint_database_url: str | None = Field(
+        default=None, validation_alias="TEST_CHECKPOINT_DATABASE_URL"
+    )
+    action_executor_database_url: str | None = Field(
+        default=None, validation_alias="ACTION_EXECUTOR_DATABASE_URL"
+    )
+    mcp_server_url: str = Field(
+        default="http://127.0.0.1:8001/mcp", validation_alias="CASEFLOW_MCP_SERVER_URL"
+    )
+    mcp_host: str = Field(default="127.0.0.1", validation_alias="CASEFLOW_MCP_HOST")
+    mcp_port: int = Field(
+        default=8001, gt=0, le=65535, validation_alias="CASEFLOW_MCP_PORT"
+    )
+    mcp_tool_timeout_seconds: float = Field(
+        default=8, gt=0, le=60, validation_alias="CASEFLOW_MCP_TOOL_TIMEOUT_SECONDS"
+    )
+    embedding_api_key: SecretStr | None = Field(
+        default=None, validation_alias="EMBEDDING_API_KEY"
+    )
+    embedding_base_url: str | None = Field(
+        default=None, validation_alias="EMBEDDING_BASE_URL"
+    )
+    embedding_model: str | None = Field(default=None, validation_alias="EMBEDDING_MODEL")
+    embedding_dimensions: int | None = Field(
+        default=None, gt=0, le=2000, validation_alias="EMBEDDING_DIMENSIONS"
+    )
+    embedding_index_database_url: str | None = Field(
+        default=None, validation_alias="EMBEDDING_INDEX_DATABASE_URL"
+    )
     openai_api_key: SecretStr | None = Field(default=None, validation_alias="OPENAI_API_KEY")
     openai_base_url: str | None = Field(default=None, validation_alias="OPENAI_BASE_URL")
     openai_model: str = Field(default="gpt-4.1-mini", validation_alias="OPENAI_MODEL")

@@ -94,9 +94,15 @@ class BM25Retriever:
 
 
 class KnowledgeService:
-    def __init__(self, engine: Engine, statement_timeout_ms: int = 3000):
+    def __init__(
+        self,
+        engine: Engine,
+        statement_timeout_ms: int = 3000,
+        vector_search: Any | None = None,
+    ):
         self.engine = engine
         self.statement_timeout_ms = statement_timeout_ms
+        self.vector_search = vector_search
         self._cache_lock = RLock()
         self._cache_signature: str | None = None
         self._retriever: BM25Retriever | None = None
@@ -147,11 +153,62 @@ class KnowledgeService:
 
     def search(self, params: KnowledgeSearchInput) -> dict[str, object]:
         retriever = self._load_index()
-        results = retriever.search(params.query, params.top_k)
+        bm25_results = retriever.search(params.query, params.top_k)
+        for result in bm25_results:
+            result["retrieval_sources"] = ["bm25"]
+        results = bm25_results
+        retrieval_mode = "bm25_only"
+        retrieval_warning = None
+        if self.vector_search is not None:
+            try:
+                vector_results = self.vector_search.search(
+                    params.query, retriever.chunks, params.top_k
+                )
+                if vector_results:
+                    results = _reciprocal_rank_fusion(bm25_results, vector_results, params.top_k)
+                    retrieval_mode = "hybrid"
+                else:
+                    retrieval_warning = "vector_index_empty_or_stale"
+            except Exception:
+                retrieval_warning = "vector_search_unavailable"
+        for result in results:
+            result["retrieval_mode"] = retrieval_mode
         return {
             "search_id": f"SRCH-{uuid4().hex[:16]}",
             "query": params.query,
-            "retriever": "jieba-tokenized BM25Okapi",
+            "retriever": (
+                "BM25 + pgvector + RRF"
+                if retrieval_mode == "hybrid"
+                else "jieba-tokenized BM25Okapi"
+            ),
+            "retrieval_mode": retrieval_mode,
+            "retrieval_warning": retrieval_warning,
             "index_size_chunks": len(retriever.chunks),
             "results": results,
         }
+
+
+def _reciprocal_rank_fusion(
+    bm25_results: list[dict[str, Any]],
+    vector_results: list[dict[str, Any]],
+    top_k: int,
+    rank_constant: int = 60,
+) -> list[dict[str, Any]]:
+    fused: dict[str, dict[str, Any]] = {}
+    for source, ranked in (("bm25", bm25_results), ("pgvector", vector_results)):
+        seen: set[str] = set()
+        for rank, item in enumerate(ranked, start=1):
+            evidence_id = str(item["evidence_id"])
+            if evidence_id in seen:
+                continue
+            seen.add(evidence_id)
+            current = fused.setdefault(
+                evidence_id,
+                {**item, "score": 0.0, "retrieval_sources": []},
+            )
+            current["score"] += 1 / (rank_constant + rank)
+            current["retrieval_sources"].append(source)
+    results = sorted(fused.values(), key=lambda item: (-item["score"], item["evidence_id"]))
+    for item in results:
+        item["score"] = round(float(item["score"]), 8)
+    return results[:top_k]

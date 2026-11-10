@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CaseFlow Agent</title>
+    <link rel="stylesheet" href="/web/style.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <header>
+        <div>
+          <p class="eyebrow">CASEFLOW · INVESTIGATION WORKBENCH</p>
+          <h1>支付事件调查</h1>
+          <p class="subtitle">以数据库记录、知识文档和可核验引用组织调查。</p>
+        </div>
+        <div class="header-actions">
+          <button id="resume-thread" class="secondary hidden">恢复中断调查</button>
+          <button id="new-thread" class="secondary">新建会话</button>
+        </div>
+      </header>
+      <section class="thread-bar">
+        <span>会话</span><code id="thread-id">尚未创建</code>
+        <span id="connection-state" class="pill">未连接</span>
+      </section>
+      <section class="workspace">
+        <div class="conversation panel">
+          <div class="panel-heading"><h2>对话</h2><span id="thread-status">等待开始</span></div>
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <form id="message-form">
+            <label for="question">调查问题</label>
+            <textarea id="question" rows="3" minlength="3" maxlength="2000" required
+              placeholder="例如：北京 2025-01-21 09:00 到 12:00 支付失败率是否异常？请查询变更和文档。"></textarea>
+            <button id="send-message" type="submit">开始调查</button>
+          </form>
+        </div>
+        <aside class="panel activity">
+          <div class="panel-heading"><h2>Agent 执行过程</h2></div>
+          <ol id="activity-list" class="activity-list"></ol>
+          <details>
+            <summary>结构化报告</summary>
+            <pre id="report">等待调查结果</pre>
+          </details>
+        </aside>
+      </section>
+      <section id="approval-panel" class="panel approval hidden">
+        <div class="panel-heading"><h2>人工审批工单</h2><span>批准前不会写入</span></div>
+        <form id="approval-form" class="draft-grid">
+          <label>标题<input id="ticket-title" required maxlength="180" /></label>
+          <label>地区<input id="ticket-region" required maxlength="40" value="北京" /></label>
+          <label>优先级<select id="ticket-priority"><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
+          <label class="wide">描述<textarea id="ticket-description" required minlength="10" maxlength="4000" rows="4"></textarea></label>
+          <div class="wide approval-actions"><button type="submit">提交待审批草稿</button></div>
+        </form>
+        <div id="pending-approval" class="hidden">
+          <div id="approval-details"></div>
+          <div class="approval-actions">
+            <button id="approve-ticket">批准并创建</button>
+            <button id="reject-ticket" class="danger">拒绝</button>
+          </div>
+          <p id="approval-result" role="status"></p>
+        </div>
+      </section>
+      <footer>本地演示界面 · 尚无用户认证，不适合直接暴露到公网。</footer>
+    </main>
+    <script src="/web/app.js" defer></script>
+  </body>
+</html>

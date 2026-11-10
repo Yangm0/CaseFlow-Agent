@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "caseflow-agent"
 version = "0.1.0"
-description = "A reproducible payment-incident investigation agent (V1-B)."
+description = "A reproducible payment-incident investigation agent (V1-C)."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
@@ -14,10 +14,14 @@ dependencies = [
   "pydantic>=2.10,<3",
   "pydantic-settings>=2.7,<3",
   "SQLAlchemy>=2.0.36,<2.1",
-  "psycopg[binary]>=3.2,<4",
+  "psycopg[binary,pool]>=3.2,<4",
   "langgraph>=0.2.60,<2",
   "langchain-core>=0.3.29,<2",
   "langchain-openai>=0.3.28,<2",
+  "langchain[mcp]>=1.4,<2",
+  "langgraph-checkpoint-postgres>=2.0.24,<4",
+  "mcp>=1.12,<2",
+  "pgvector>=0.3,<1",
   "rank-bm25>=0.2.2,<1",
   "jieba>=0.42.1,<1",
 ]
@@ -28,6 +32,9 @@ dev = [
   "pytest>=8.3,<9",
   "ruff>=0.9,<1",
 ]
+
+[project.scripts]
+caseflow-mcp = "caseflow_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
