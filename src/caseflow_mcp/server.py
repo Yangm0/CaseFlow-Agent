@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from pydantic import ValidationError
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -20,8 +20,6 @@ engine = make_engine(settings.database_url)
 tools = build_tool_registry(engine, settings.sql_statement_timeout_ms, settings)
 mcp = FastMCP(
     "CaseFlow read-only investigation tools",
-    host=settings.mcp_host,
-    port=settings.mcp_port,
 )
 
 
@@ -88,7 +86,7 @@ async def health(_: Request) -> JSONResponse:
 
 def main() -> None:
     try:
-        mcp.run(transport="streamable-http")
+        mcp.run(transport="http", host=settings.mcp_host, port=settings.mcp_port)
     finally:
         engine.dispose()
 

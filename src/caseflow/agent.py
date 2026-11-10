@@ -229,6 +229,17 @@ class OfflineFakeModel:
 
     regions = ("北京", "上海", "深圳", "杭州")
 
+    @staticmethod
+    def has_prior_investigation(question: str, messages: list[BaseMessage]) -> bool:
+        """Recognize a narrow follow-up that refers to a saved offline investigation."""
+        refers_to_history = any(token in question for token in ("上一轮", "刚才", "之前"))
+        prior_assistant_messages = [
+            message
+            for message in messages[:-1]
+            if isinstance(message, AIMessage) and _content_text(message.content).strip()
+        ]
+        return refers_to_history and bool(prior_assistant_messages)
+
     def decide(
         self,
         messages: list[BaseMessage],
@@ -238,6 +249,15 @@ class OfflineFakeModel:
         used = [item["tool_name"] for item in tool_results]
         if any(item.get("error") for item in tool_results):
             return AIMessage(content="")
+
+        if not tool_results and self.has_prior_investigation(question, messages):
+            return AIMessage(
+                content=(
+                    "上一轮调查的统计和事件结论已保存在当前会话中：异常信号及时间线关联可用于排查，"
+                    "但尚未确认根因。仍需核对逐笔失败码、上游延迟分位数和完整发布前后日志；"
+                    "变更与异常的时间重叠不能单独证明因果。"
+                )
+            )
 
         metric_item = next(
             (
@@ -846,9 +866,15 @@ class InvestigationAgent:
         direct_answer = state.get("direct_answer")
         if not tool_calls and not self._has_successful_tool(state.get("tool_traces", [])):
             content = _content_text(getattr(response, "content", ""))
-            can_answer_directly = not state.get(
-                "tool_traces"
-            ) and self._is_general_capability_question(state["question"])
+            can_answer_directly = not state.get("tool_traces") and (
+                self._is_general_capability_question(state["question"])
+                or (
+                    isinstance(self.model, OfflineFakeModel)
+                    and self.model.has_prior_investigation(
+                        state["question"], state.get("messages", [])
+                    )
+                )
+            )
             if (
                 can_answer_directly
                 and content.strip()
@@ -1270,6 +1296,9 @@ class InvestigationAgent:
                     events.append(ChangeEvidence.model_validate(result))
 
         summary = self._summary(metrics, documents, events)
+        direct_answer = state.get("direct_answer")
+        if direct_answer and not metrics and not documents and not events:
+            summary = direct_answer
         error = state.get("error")
         status = state.get("status", "completed")
         successful_tools = any(
@@ -1305,7 +1334,7 @@ class InvestigationAgent:
             "mode": self.mode,
             "status": status,
             "summary": summary,
-            "direct_answer": state.get("direct_answer"),
+            "direct_answer": direct_answer,
             "statistical_facts": [item.model_dump() for item in metrics],
             "document_evidence": [item.model_dump() for item in documents],
             "system_events": [item.model_dump() for item in events],

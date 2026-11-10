@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
@@ -66,14 +67,12 @@ def build_mcp_tool_registry(settings: Settings) -> dict[str, BaseTool]:
                     result = await asyncio.wait_for(
                         _remote.ainvoke(wire_arguments), timeout=settings.mcp_tool_timeout_seconds
                     )
-                    if isinstance(result, tuple) and len(result) == 2:
-                        content, artifact = result
-                        if artifact is not None:
-                            output = artifact
-                        else:
-                            output = content
-                    else:
-                        output = result
+                    output = _structured_tool_output(result)
+                    if not isinstance(output, dict):
+                        raise ToolFailure(
+                            "MCP_INVALID_RESULT",
+                            "The MCP tool did not return a structured object.",
+                        )
                     if isinstance(output, dict) and output.get("error"):
                         detail = output["error"]
                         raise ToolFailure(
@@ -111,9 +110,51 @@ def build_mcp_tool_registry(settings: Settings) -> dict[str, BaseTool]:
 async def _discover(settings: Settings) -> list[BaseTool]:
     from langchain.mcp import MCPAdapter
 
-    adapter = MCPAdapter(
-        settings.mcp_server_url,
-        default_tool_timeout=int(settings.mcp_tool_timeout_seconds * 1000),
-    )
+    adapter = MCPAdapter(settings.mcp_server_url)
     async with adapter:
         return await asyncio.wait_for(adapter.list_tools(), timeout=10)
+
+
+def _structured_tool_output(value: Any) -> Any:
+    """Normalize MCP artifacts and JSON text blocks into the tool's structured dictionary."""
+    if isinstance(value, tuple) and len(value) == 2:
+        content, artifact = value
+        return _structured_tool_output(artifact if artifact is not None else content)
+    structured = getattr(value, "structuredContent", None) or getattr(
+        value, "structured_content", None
+    )
+    if structured is not None:
+        return _structured_tool_output(structured)
+    if isinstance(value, dict):
+        structured = value.get("structuredContent", value.get("structured_content"))
+        if structured is not None:
+            return _structured_tool_output(structured)
+        if value.get("isError"):
+            return {"error": {"code": "MCP_TOOL_FAILED", "message": "MCP reported a tool error."}}
+        if isinstance(value.get("content"), list):
+            return _structured_tool_output(value["content"])
+        return value
+    if isinstance(value, list):
+        text_blocks = [
+            block["text"]
+            for block in value
+            if isinstance(block, dict)
+            and block.get("type") in ("text", "output_text")
+            and isinstance(block.get("text"), str)
+        ]
+        if text_blocks:
+            try:
+                parsed = json.loads("\n".join(text_blocks))
+            except json.JSONDecodeError:
+                return None
+            return _structured_tool_output(parsed)
+        return None
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        return _structured_tool_output(parsed)
+    if hasattr(value, "model_dump"):
+        return _structured_tool_output(value.model_dump(mode="json"))
+    return None

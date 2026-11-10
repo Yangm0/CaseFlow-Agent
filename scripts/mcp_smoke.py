@@ -10,6 +10,8 @@ import time
 import httpx
 
 from caseflow.config import get_settings
+from caseflow.mcp_client import _structured_tool_output, build_mcp_tool_registry
+from caseflow.tools.common import ToolFailure
 
 
 async def _exercise(url: str) -> dict[str, object]:
@@ -40,7 +42,19 @@ async def _exercise(url: str) -> dict[str, object]:
         )
     if isinstance(result, dict) and result.get("error"):
         raise RuntimeError("The MCP metrics call returned a tool error.")
-    return {"discovered_tools": sorted(by_name), "metrics_result": result}
+    invalid_result = await by_name["query_payment_metrics"].ainvoke(
+        {
+            "region": "",
+            "start_at": "2025-01-21T09:00:00+08:00",
+            "end_at": "2025-01-21T12:00:00+08:00",
+            "group_by": [],
+        }
+    )
+    invalid_output = _structured_tool_output(invalid_result)
+    invalid_error = invalid_output.get("error", {}) if isinstance(invalid_output, dict) else {}
+    if invalid_error.get("code") != "INVALID_TOOL_ARGUMENTS":
+        raise RuntimeError("The MCP server did not return its structured invalid-parameter error.")
+    return {"discovered_tools": sorted(by_name), "schema_properties": sorted(schema_fields)}
 
 
 async def main() -> int:
@@ -60,6 +74,7 @@ async def main() -> int:
     test_engine.dispose()
 
     endpoint = f"http://127.0.0.1:{args.port}/mcp"
+    tools = None
     environment = os.environ.copy()
     environment["DATABASE_URL"] = test_url
     environment["CASEFLOW_MCP_HOST"] = "127.0.0.1"
@@ -85,7 +100,38 @@ async def main() -> int:
                     await asyncio.sleep(0.25)
             else:
                 raise RuntimeError("The local MCP server did not become healthy in time.")
-        print(await _exercise(endpoint))
+        discovery = await _exercise(endpoint)
+        wrapped_settings = settings.model_copy(
+            update={"database_url": test_url, "mcp_server_url": endpoint}
+        )
+        tools = await asyncio.to_thread(build_mcp_tool_registry, wrapped_settings)
+        result = await asyncio.to_thread(
+            tools["query_payment_metrics"].invoke,
+            {
+                "region": "北京",
+                "start_at": "2025-01-21T09:00:00+08:00",
+                "end_at": "2025-01-21T12:00:00+08:00",
+                "group_by": [],
+            },
+        )
+        metrics = result.get("metrics", {}) if isinstance(result, dict) else {}
+        baseline = result.get("baseline", {}) if isinstance(result, dict) else {}
+        if metrics.get("valid_attempts") != 50 or metrics.get("failed_attempts") != 22:
+            raise RuntimeError("The MCP client did not return the structured test metrics.")
+        if baseline.get("valid_attempts") != 330 or baseline.get("failed_attempts") != 10:
+            raise RuntimeError("The MCP client did not return the seven-window baseline.")
+        print(
+            {
+                **discovery,
+                "client_result_type": type(result).__name__,
+                "invalid_parameter_code": "INVALID_TOOL_ARGUMENTS",
+                "valid_attempts": metrics["valid_attempts"],
+                "failed_attempts": metrics["failed_attempts"],
+                "failure_rate": metrics["failure_rate"],
+                "baseline_attempts": baseline["valid_attempts"],
+                "baseline_failures": baseline["failed_attempts"],
+            }
+        )
     finally:
         process.terminate()
         try:
@@ -93,6 +139,19 @@ async def main() -> int:
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait()
+    if tools is None:
+        raise RuntimeError("MCP registry was not created during the connected smoke.")
+    try:
+        await asyncio.to_thread(
+            tools["search_knowledge"].invoke,
+            {"query": "断线检查", "top_k": 1},
+        )
+    except ToolFailure as error:
+        if error.code != "MCP_UNAVAILABLE":
+            raise RuntimeError("MCP disconnection returned an unexpected error code.") from error
+        print({"disconnect_error_code": error.code})
+    else:
+        raise RuntimeError("MCP tool call unexpectedly succeeded after the server stopped.")
     return 0
 
 

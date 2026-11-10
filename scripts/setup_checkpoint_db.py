@@ -4,7 +4,10 @@ import argparse
 import os
 import sys
 
+from sqlalchemy.engine import make_url
+
 from caseflow.checkpoints.runtime import _driver_uri
+from caseflow.config import get_settings
 
 
 def main() -> int:
@@ -13,10 +16,24 @@ def main() -> int:
     )
     parser.add_argument("--test", action="store_true", help="Use TEST_CHECKPOINT_DATABASE_URL.")
     args = parser.parse_args()
+    settings = get_settings()
     variable = "TEST_CHECKPOINT_DATABASE_URL" if args.test else "CHECKPOINT_DATABASE_URL"
-    database_url = os.environ.get(variable)
+    database_url = (
+        settings.test_checkpoint_database_url if args.test else settings.checkpoint_database_url
+    )
     if not database_url:
-        print(f"{variable} is required; checkpoint setup was not run.")
+        print(f"{variable} is required in the environment or project .env; setup was not run.")
+        return 2
+    expected_database = "caseflow_test" if args.test else "caseflow"
+    try:
+        selected_database = make_url(database_url).database
+    except Exception:
+        print(f"{variable} is not a valid PostgreSQL URL; checkpoint setup was not run.")
+        return 2
+    if selected_database != expected_database:
+        print(
+            f"{variable} must target {expected_database}; checkpoint setup was not run."
+        )
         return 2
 
     os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")

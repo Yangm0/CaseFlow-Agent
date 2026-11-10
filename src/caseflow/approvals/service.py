@@ -157,7 +157,6 @@ class ApprovalWorkflow:
         return {
             "configurable": {
                 "thread_id": f"caseflow-approval:{approval_id}",
-                "checkpoint_ns": "caseflow_approvals",
             }
         }
 
@@ -172,6 +171,15 @@ class ApprovalWorkflow:
             config=self.config(str(approval["approval_id"])),
         )
         return dict(result)
+
+    def ensure_pending_interrupt(self, approval: dict[str, Any]) -> dict[str, Any]:
+        """Recreate an interrupted checkpoint if DB creation committed before checkpointing."""
+        if approval.get("status") != "pending":
+            return approval
+        snapshot = self.graph.get_state(self.config(str(approval["approval_id"])))
+        if snapshot and snapshot.next:
+            return dict(snapshot.values)
+        return self.request(approval)
 
     def resume(self, approval_id: str, decision: ApprovalDecision) -> dict[str, Any]:
         from langgraph.types import Command

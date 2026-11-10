@@ -11,6 +11,8 @@ WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'caseflow_action_execut
 SELECT format('ALTER ROLE caseflow_action_executor PASSWORD %L', :'action_password') \gexec
 SELECT 'CREATE ROLE caseflow_action_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'caseflow_action_owner') \gexec
+SELECT 'CREATE ROLE caseflow_vector_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT'
+WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'caseflow_vector_owner') \gexec
 SELECT format('CREATE ROLE caseflow_embedding_indexer LOGIN PASSWORD %L NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT', :'embedding_password')
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'caseflow_embedding_indexer') \gexec
 SELECT format('ALTER ROLE caseflow_embedding_indexer PASSWORD %L', :'embedding_password') \gexec

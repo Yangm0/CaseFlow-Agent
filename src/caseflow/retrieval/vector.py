@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import threading
 from collections.abc import Sequence
 from typing import Any
@@ -23,6 +24,10 @@ class VectorSearchService:
         self.engine = engine
         self.provider = provider
         self.statement_timeout_ms = statement_timeout_ms
+        if not self.provider.model or len(self.provider.model) > 240:
+            raise ValueError("Embedding model name must contain between 1 and 240 characters.")
+        if not 1 <= self.provider.dimensions <= 2000:
+            raise ValueError("Embedding dimensions must be between 1 and 2000.")
         self._query_cache: dict[str, list[float]] = {}
         self._query_cache_lock = threading.Lock()
 
@@ -40,12 +45,16 @@ class VectorSearchService:
                 self._query_cache[query_key] = vector
         if len(vector) != self.provider.dimensions:
             raise ValueError("Query embedding dimension does not match the configured model.")
+        if any(not math.isfinite(float(value)) for value in vector):
+            raise ValueError("Query embedding contains a non-finite value.")
         current_hashes = {
             (chunk.document_id, chunk.chunk_id): content_hash(chunk.title, chunk.text)
             for chunk in chunks
         }
         if not current_hashes:
             return []
+        dimensions = self.provider.dimensions
+        model_literal = _sql_literal(self.provider.model)
         with readonly_transaction(self.engine, self.statement_timeout_ms) as connection:
             rows = connection.execute(
                 text(
@@ -53,17 +62,18 @@ class VectorSearchService:
                     "CAST(:document_ids AS text[]), CAST(:chunk_ids AS text[]), "
                     "CAST(:content_hashes AS text[])) AS c(document_id, chunk_id, content_hash)) "
                     "SELECT e.document_id, e.chunk_id, e.title, e.content, e.content_hash, "
-                    "e.embedding <=> CAST(:embedding AS vector) AS distance "
+                    f"e.embedding::vector({dimensions}) <=> "
+                    f"CAST(:embedding AS vector({dimensions})) AS distance "
                     "FROM caseflow_vectors.document_embeddings AS e "
                     "JOIN current_chunks AS c ON c.document_id = e.document_id "
                     "AND c.chunk_id = e.chunk_id AND c.content_hash = e.content_hash "
-                    "WHERE e.embedding_model = :model AND e.dimensions = :dimensions "
-                    "ORDER BY e.embedding <=> CAST(:embedding AS vector) LIMIT :top_k"
+                    f"WHERE e.embedding_model = {model_literal} "
+                    f"AND e.dimensions = {dimensions} "
+                    f"ORDER BY e.embedding::vector({dimensions}) <=> "
+                    f"CAST(:embedding AS vector({dimensions})) LIMIT :top_k"
                 ),
                 {
                     "embedding": _vector_literal(vector),
-                    "model": self.provider.model,
-                    "dimensions": self.provider.dimensions,
                     "document_ids": [key[0] for key in current_hashes],
                     "chunk_ids": [key[1] for key in current_hashes],
                     "content_hashes": list(current_hashes.values()),
@@ -127,6 +137,13 @@ class EmbeddingIndexer:
         existing = {
             (row["document_id"], row["chunk_id"]): row["content_hash"] for row in existing_rows
         }
+        current_keys = {(chunk.document_id, chunk.chunk_id) for chunk in chunks}
+        stale = sorted(set(existing) - current_keys)
+        with self.write_engine.begin() as connection:
+            connection.execute(
+                text("SELECT caseflow_vectors.ensure_hnsw_index(:model, :dimensions)"),
+                {"model": self.provider.model, "dimensions": self.provider.dimensions},
+            )
         changed = [
             chunk
             for chunk in chunks
@@ -172,8 +189,34 @@ class EmbeddingIndexer:
                     rows,
                 )
             indexed += len(batch)
-        return {"documents": len(documents), "chunks": len(chunks), "indexed_chunks": indexed}
+        deleted = 0
+        for offset in range(0, len(stale), batch_size):
+            batch = stale[offset : offset + batch_size]
+            with self.write_engine.begin() as connection:
+                result = connection.execute(
+                    text(
+                        "DELETE FROM caseflow_vectors.document_embeddings "
+                        "WHERE embedding_model = :model AND document_id = :document_id "
+                        "AND chunk_id = :chunk_id"
+                    ),
+                    [
+                        {"model": self.provider.model, "document_id": doc, "chunk_id": chunk}
+                        for doc, chunk in batch
+                    ],
+                )
+                deleted += result.rowcount or 0
+        return {
+            "documents": len(documents),
+            "chunks": len(chunks),
+            "indexed_chunks": indexed,
+            "deleted_chunks": deleted,
+        }
 
 
 def _vector_literal(vector: Sequence[float]) -> str:
     return "[" + ",".join(format(float(value), ".9g") for value in vector) + "]"
+
+
+def _sql_literal(value: str) -> str:
+    """Quote the configured model name so PostgreSQL can prove the partial-index predicate."""
+    return "'" + value.replace("'", "''") + "'"

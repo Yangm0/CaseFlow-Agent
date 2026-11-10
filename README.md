@@ -2,16 +2,24 @@
 
 CaseFlow is a local engineering demonstration for payment incident investigations. It combines a LangGraph investigation loop, PostgreSQL read-only tools, Chinese BM25 retrieval, optional pgvector hybrid search, MCP tool transport, durable threads, and a human-approved support-ticket action. It is not a production payment control plane.
 
-## V1-C status
+## V1-C acceptance status
 
-| State | Scope |
+**Locally exercised on 2026-11-11** against the existing synthetic PostgreSQL databases. This is a loopback-bound engineering demo, not a production deployment.
+
+Detailed evidence, including database preservation, tool traces, Live usage, and remaining limits, is in [V1-C final acceptance](docs/V1C_ACCEPTANCE_2026-11-11.md).
+
+| Area | Verified result |
 |---|---|
-| Implemented before V1-C | FastAPI, PostgreSQL metrics/change queries, BM25, structured reports, evidence ID and quote checks, bounded Agent loop, offline fake model, Live OpenAI-compatible chat provider. |
-| Written in V1-C; not yet run or verified | Independent MCP server/client, PostgresSaver thread checkpoints, thread APIs, interrupt/resume approval workflow, restricted ticket SQL functions, pgvector schema and incremental indexer, RRF, SSE, browser UI, container services, manual CI. |
-| Requires operator configuration | Checkpoint/action/indexer database roles and migrations; independent MCP server URL; chat credentials for Live mode; embedding provider key/model/dimensions for Vector/Hybrid mode. |
-| Not implemented | Real reranker provider; automatic LLM-created ticket proposal; user authentication/authorization; production deployment controls. The UI prefills a reviewable draft from the report and the human edits/submits it. |
+| Python and Compose | Existing `.venv`; dependency/import smoke, `pip check`, Ruff, and Compose config passed. |
+| PostgreSQL and data | PostgreSQL 17.11 and pgvector 0.8.7 healthy. Both databases retained 49,600 attempts, 18 documents, 7 changes, and 4 incidents. Pre-migration custom-format backups were readable. |
+| MCP and Agent | Standalone MCP discovered all three tools, validated schemas/errors/disconnects, and returned structured results. Thread investigations used the MCP client against the real test database. |
+| Threads and approvals | Multi-turn thread state survived API/checkpointer restarts and remained isolated by thread. Reject, approve, duplicate and parallel decisions, hash tampering, orphan recovery, audit writes, and direct-write denial were exercised on `caseflow_test`; acceptance work orders were cleaned up. |
+| Retrieval | BM25 fallback and BM25 + pgvector + RRF ran against 18 indexed deterministic 64D test vectors. `EXPLAIN` showed the matching HNSW expression index. Add/update/delete index synchronization passed. These hash vectors test plumbing only; semantic embedding quality was not evaluated. |
+| Browser and SSE | UI investigation, report/evidence, approval decisions, refresh/reload, and SSE event replay after reconnect were exercised in a browser. |
+| Regression | Exactly 8 pytest cases collected and passed. `scripts/mcp_smoke.py` and `scripts/v1c_smoke.py` passed. |
+| Live model | One real investigation completed through the configured zero-price OpenRouter `nvidia/nemotron-3.5-super-vl:free` route: 3 model requests, 8,408 reported tokens, 23.3 s, $0. No fallback was configured. Citation ID/quote checks passed; semantic support for two hypotheses remains ungraded. |
 
-**The V1-C changes have not been run through pytest, Docker, database migrations, MCP smoke, embedding calls, or an LLM today.** The previous V1-B verification below is historical evidence for the earlier code and does not verify the new V1-C code.
+No automatic LLM-created ticket proposal, authentication/authorization layer, production deployment controls, or real embedding provider evaluation is included. The UI prefills a reviewable draft and a human submits it.
 
 ## Architecture
 
@@ -35,7 +43,9 @@ LangGraph checkpoints each thread with a `thread_id`. `history` stores the user'
 
 The approval graph stores a pending draft, calls LangGraph `interrupt()`, then waits for an API decision to resume with `Command(resume=...)`. The executor role has `EXECUTE` access to a few `SECURITY DEFINER` database functions only; it has no direct table DML. Those functions bind the approved payload to a database-computed SHA-256 hash, lock the approval row, deduplicate the same active or executed draft within a thread, create at most one ticket per approval, and record audit events in the same transaction. The existing `caseflow_app` remains read-only. Unapproved or changed drafts cannot reach ticket creation. The project has no authentication, so keep it bound to loopback for local demonstration.
 
-BM25 always remains available. If a separate embedding provider is fully configured and the vector table has fresh vectors, retrieval combines BM25 and pgvector rankings with Reciprocal Rank Fusion (RRF), deduplicates stable evidence IDs, and labels the result `hybrid`; otherwise the result is labeled `bm25_only`. There are no fake vectors. A content hash and model name key the stored embedding cache. The reranker is only a provider protocol.
+The checkpointer uses a small psycopg connection pool. Its thread registry retries one transient PostgreSQL connection error, allowing a running API process to recover its durable thread state after a PostgreSQL restart.
+
+BM25 always remains available. If a separate embedding provider is fully configured and the vector table has fresh vectors, retrieval combines BM25 and pgvector rankings with Reciprocal Rank Fusion (RRF), deduplicates stable evidence IDs, and labels the result `hybrid`; otherwise the result is labeled `bm25_only`. The acceptance smoke used a deterministic local hash-vector fixture to test database/index plumbing only; it is not a semantic embedding and is not used as evidence of retrieval quality. A content hash and model name key the stored embedding cache. The reranker is only a provider protocol.
 
 SSE exposes `status`, `agent_step`, `tool_start`, `tool_result`, `evidence`, `approval_required`, `completed`, and `error`. The bounded event journal is process-local; thread history and latest report are durable and can be fetched again after reconnect or process restart, but old intermediate SSE events are not persisted.
 
@@ -67,7 +77,7 @@ $env:TMP = $env:TEMP
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-The Compose PostgreSQL service uses the official `pgvector/pgvector:pg17` image and retains the existing `caseflow_pgdata` named volume. Compose does not contain a volume deletion or reset command. The image change can recreate the container the next time the stack is started; back up the existing database before doing so. **Do not use `docker compose down -v`.** The V1-C migration and checkpoint `setup()` are separate, explicit steps; neither runs at API startup.
+The Compose PostgreSQL service builds `Dockerfile.postgres`: pgvector 0.8.7 is compiled into the same `postgres:17-alpine` base used by the existing instance. This preserves PostgreSQL's Alpine/libc data-directory compatibility while retaining the existing `caseflow_pgdata` named volume. The V1-C acceptance backed up both databases before applying migrations, and verified the custom-format dumps were readable. Compose does not contain a volume deletion or reset command. **Do not use `docker compose down -v`.** The V1-C migration and checkpoint `setup()` are separate, explicit steps; neither runs at API startup.
 
 For a fresh local setup, review `.env.example`, change the development-only passwords, and then start services:
 
@@ -106,27 +116,27 @@ The deterministic generator uses seed `20250121` and contains 49,600 payment att
 
 ## Tests and manual CI
 
-The existing suite is limited to eight collected pytest cases. V1-C has not added a test function; new behavior still requires regression coverage without raising the total above eight. The GitHub Actions workflow `Manual quality and PostgreSQL integration` has only the `workflow_dispatch` trigger and was not run today.
+The suite remains limited to eight collected pytest cases. On 2026-11-11, collect-only reported 8, the full suite passed 8/8, and Ruff was clean. `scripts/v1c_smoke.py` exercises real test-PostgreSQL vector indexing/search and the approval/recovery/permission path without increasing pytest collection. `scripts/mcp_smoke.py` launches the standalone MCP server and tests the transport. The GitHub Actions workflow `Manual quality and PostgreSQL integration` has only the `workflow_dispatch` trigger; it was not dispatched as part of this local acceptance.
 
-After the V1-C code is ready for verification, run in this order:
+Re-run the local acceptance checks with:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest --collect-only -q
 ruff check src scripts tests
 .\.venv\Scripts\python.exe -m pytest -q
 .\.venv\Scripts\python.exe scripts\mcp_smoke.py
+.\.venv\Scripts\python.exe scripts\v1c_smoke.py
 ```
 
-Then verify PostgreSQL roles/checkpoint restoration and approvals, run BM25 and labeled Vector/Hybrid retrieval comparisons, inspect SSE/UI reconnect and approval behavior, and only then decide whether a bounded Live LLM smoke is needed. Live call count depends on provider routing and fallback behavior; keep the request cap explicit and do not switch to paid routes. No live or embedding API calls were made while preparing V1-C.
+The `v1c_smoke.py` script creates uniquely tagged approval acceptance rows in `caseflow_test`; after inspecting its report, remove only that run's tagged approval, ticket, audit, and checkpoint rows. It does not reset databases or volumes. Browser/SSE checks and Live calls are separate. A Live call uses the configured model and consumes the provider's quota; confirm current zero-price routing and available quota first, cap total requests, and do not switch to paid routes. The 2026-11-11 Live investigation used 3 model requests on a route verified at zero prompt/completion price.
 
 ## V1-B validation record (historical)
 
-The earlier V1-B baseline reported Python 3.13.2, Docker Desktop/PostgreSQL 17, eight collected tests passing, and a real offline PostgreSQL+BM25 investigation returning Beijing 22/50 (44.00%) against 10/330 (3.03%). It recorded tool order metrics → changes → knowledge search and exact server-generated citation matching. The earlier Live run was pre-fix only; no post-fix Live result was available because free quota had not been confirmed. The details are preserved in the preceding PR history and are not evidence that V1-C works.
+The earlier V1-B baseline reported Python 3.13.2, Docker Desktop/PostgreSQL 17, eight collected tests passing, and a real offline PostgreSQL+BM25 investigation returning Beijing 22/50 (44.00%) against 10/330 (3.03%). It recorded tool order metrics → changes → knowledge search and exact server-generated citation matching. At that earlier V1-B checkpoint, a post-fix Live result was not available because free quota had not been confirmed. The V1-C Live investigation is documented in the acceptance record above; this historical baseline is not evidence for V1-C.
 
 ## Limitations
 
-- This branch has not yet installed the new optional infrastructure packages or verified their exact runtime compatibility.
-- The existing database volume does not automatically acquire new roles, extension, tables, or functions. Explicit migration/setup is needed; none was run during V1-C coding.
+- A real Embedding provider was not configured. The deterministic test vectors validate pgvector storage, index selection, and retrieval code paths, not semantic relevance or an embedding benchmark.
 - The tool approval form is populated from an evidence-backed report but is submitted by a human; an LLM-generated ticket draft or automatic “should we open a ticket?” decision is not implemented.
 - The event journal is in process memory; durable conversation history and latest reports are available through the thread endpoint after reconnect.
 - The project has no authentication, multi-user isolation, public ingress protection, ticket lifecycle beyond creation, or production operations policy.

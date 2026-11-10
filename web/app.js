@@ -171,6 +171,14 @@
       const result = await request(`/api/v1/threads/${state.threadId}/approvals/${state.approvalId}/decision`, {
         method: "POST", body: JSON.stringify({ decision }),
       });
+      const approval = await request(
+        `/api/v1/threads/${state.threadId}/approvals/${state.approvalId}`,
+      );
+      renderApproval({
+        ...approval,
+        draft: approval.action_payload,
+        evidence_ids: (state.report?.statistical_facts || []).map((item) => item.evidence_id),
+      });
       $("approval-result").textContent = JSON.stringify(result, null, 2);
       activity("审批结果", JSON.stringify(result));
     } catch (error) { $("approval-result").textContent = error.message; }

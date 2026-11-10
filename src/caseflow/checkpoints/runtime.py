@@ -8,6 +8,9 @@ from typing import TypedDict
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
+from psycopg import OperationalError
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 
 def _driver_uri(database_url: str) -> str:
@@ -20,16 +23,23 @@ def _driver_uri(database_url: str) -> str:
 
 @contextmanager
 def open_checkpointer(database_url: str) -> Iterator[object]:
-    """Open a dedicated checkpointer connection; setup is an explicit deployment operation."""
+    """Open a reconnecting pool for checkpoints; setup remains an explicit operation."""
     os.environ.setdefault("LANGGRAPH_STRICT_MSGPACK", "true")
     from langgraph.checkpoint.postgres import PostgresSaver
 
-    manager = PostgresSaver.from_conn_string(_driver_uri(database_url))
-    checkpointer = manager.__enter__()
+    pool = ConnectionPool(
+        conninfo=_driver_uri(database_url),
+        min_size=1,
+        max_size=4,
+        timeout=10,
+        kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
+        open=False,
+    )
     try:
-        yield checkpointer
+        pool.open(wait=True)
+        yield PostgresSaver(pool)
     finally:
-        manager.__exit__(None, None, None)
+        pool.close()
 
 
 class ThreadMetadata(TypedDict):
@@ -38,9 +48,9 @@ class ThreadMetadata(TypedDict):
 
 
 class ThreadRegistry:
-    """Use a separate checkpoint namespace to durably register threads before their first turn."""
+    """Use a prefixed checkpoint thread ID to register user threads durably."""
 
-    namespace = "caseflow_threads"
+    namespace = "caseflow-registry"
 
     def __init__(self, checkpointer: object):
         builder = StateGraph(ThreadMetadata)
@@ -52,7 +62,7 @@ class ThreadRegistry:
     @staticmethod
     def _config(thread_id: str) -> dict[str, object]:
         return {
-            "configurable": {"thread_id": thread_id, "checkpoint_ns": ThreadRegistry.namespace}
+            "configurable": {"thread_id": f"{ThreadRegistry.namespace}:{thread_id}"}
         }
 
     def create(self) -> dict[str, str]:
@@ -65,7 +75,13 @@ class ThreadRegistry:
         return {"thread_id": thread_id, **metadata}
 
     def get(self, thread_id: str) -> dict[str, str] | None:
-        snapshot = self.graph.get_state(self._config(thread_id))
+        config = self._config(thread_id)
+        try:
+            snapshot = self.graph.get_state(config)
+        except OperationalError:
+            # A database restart can invalidate an in-use pooled connection. The
+            # pool discards it; retry once after it has replenished the connection.
+            snapshot = self.graph.get_state(config)
         if not snapshot.values:
             return None
         return {

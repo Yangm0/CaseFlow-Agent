@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from contextlib import ExitStack, asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -28,6 +29,7 @@ from caseflow.schemas import InvestigationReport, InvestigationRequest
 from caseflow.tools.registry import build_tool_registry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+WEB_ROOT = Path(os.environ.get("CASEFLOW_WEB_ROOT", PROJECT_ROOT / "web"))
 
 
 class ThreadLocks:
@@ -214,6 +216,11 @@ def create_app(
             pending_approvals = [
                 item for item in pending_approvals if item.get("status") == "pending"
             ]
+            workflow = ApprovalWorkflow(
+                application.state.checkpointer, application.state.action_store
+            )
+            for approval in pending_approvals:
+                await asyncio.to_thread(workflow.ensure_pending_interrupt, approval)
         thread_status = (
             "awaiting_approval"
             if pending_approvals
@@ -368,7 +375,7 @@ def create_app(
                 approval = action_store.create_pending(thread_id, request.draft)
                 if approval.get("status") == "pending":
                     workflow = ApprovalWorkflow(checkpointer, action_store)
-                    workflow.request(approval)
+                    workflow.ensure_pending_interrupt(approval)
                 return approval
 
             approval = await asyncio.to_thread(create_and_pause)
@@ -395,7 +402,12 @@ def create_app(
         action_store = require_action_store(application.state.checkpointer)
         if await asyncio.to_thread(registry.get, thread_id) is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
-        return await asyncio.to_thread(action_store.list_for_thread, thread_id)
+        approvals = await asyncio.to_thread(action_store.list_for_thread, thread_id)
+        workflow = ApprovalWorkflow(application.state.checkpointer, action_store)
+        for approval in approvals:
+            if approval.get("status") == "pending":
+                await asyncio.to_thread(workflow.ensure_pending_interrupt, approval)
+        return approvals
 
     @application.get("/api/v1/threads/{thread_id}/approvals/{approval_id}")
     async def get_approval(thread_id: str, approval_id: str):
@@ -406,6 +418,9 @@ def create_app(
         approval = await asyncio.to_thread(action_store.get, approval_id)
         if approval is None or approval.get("thread_id") != thread_id:
             raise HTTPException(status_code=404, detail="Approval not found.")
+        if approval.get("status") == "pending":
+            workflow = ApprovalWorkflow(application.state.checkpointer, action_store)
+            await asyncio.to_thread(workflow.ensure_pending_interrupt, approval)
         return approval
 
     @application.post("/api/v1/threads/{thread_id}/approvals/{approval_id}/decision")
@@ -427,6 +442,7 @@ def create_app(
 
             def resume_workflow() -> dict[str, Any]:
                 workflow = ApprovalWorkflow(checkpointer, action_store)
+                workflow.ensure_pending_interrupt(approval)
                 return workflow.resume(approval_id, decision)
 
             try:
@@ -446,7 +462,7 @@ def create_app(
 
     application.mount(
         "/web",
-        StaticFiles(directory=str(PROJECT_ROOT / "web"), html=True),
+        StaticFiles(directory=str(WEB_ROOT), html=True),
         name="web",
     )
 
@@ -454,7 +470,7 @@ def create_app(
     def web_ui():
         from fastapi.responses import FileResponse
 
-        return FileResponse(PROJECT_ROOT / "web" / "index.html")
+        return FileResponse(WEB_ROOT / "index.html")
 
     return application
 
