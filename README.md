@@ -2,6 +2,17 @@
 
 CaseFlow is a small, reviewable payment-incident investigation agent. It connects a FastAPI request to read-only PostgreSQL queries, Chinese BM25 retrieval, and an explicit LangGraph tool loop. It is intended as an interviewable engineering project, not a production payment control plane.
 
+## Current local verification status
+
+Verified on Windows with Python 3.13.2 on 2026-11-10:
+
+- Installed `.[dev]` into the existing `.venv` through the active v2rayN proxy (`127.0.0.1:10808`). FastAPI, LangGraph, SQLAlchemy, psycopg, jieba, and pytest all import successfully.
+- Docker Desktop 4.99.0 is running with Docker Engine 29.9.3, Compose 5.7.0, and its WSL 2 backend. PostgreSQL 17.11 is healthy on `127.0.0.1:5432`.
+- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, 4 incidents, and 12 metadata rows. Re-seeding `caseflow` leaves those counts unchanged. The application role can select but cannot insert, update, or delete; the seed role can create objects in the project schema.
+- Pytest collected 8 tests and all 8 passed, including the PostgreSQL integration checks and offline FastAPI end-to-end investigation. No tests were skipped.
+- A real offline API request returned HTTP 200 and `completed`. It called `query_payment_metrics`, `query_change_events`, and `search_knowledge` in that order. PostgreSQL returned 22/50 failed attempts (44%) versus 10/330 (3.03%) across the seven prior matching windows. The report included related change and incident records, five BM25 passages, and a low-confidence route/retry hypothesis with source-checked quotations; it states that the evidence does not prove causation.
+- This is offline engineering acceptance using the deterministic fake model. No paid or live LLM request was made, and it is not a live model quality evaluation.
+
 ## V1-A scope
 
 - PostgreSQL tables for synthetic payment attempts, service changes, incidents, documents, and dataset metadata.

@@ -1,0 +1,24 @@
+{
+  "dataset_id": "caseflow-v1a-synthetic-2025-01",
+  "scope": "evaluation_only_not_loaded_into_prompt_or_database",
+  "scenario_id": "bj-payment-router-anomaly-2025-01-21-am",
+  "region": "北京",
+  "window_start": "2025-01-21T09:00:00+08:00",
+  "window_end_exclusive": "2025-01-21T12:00:00+08:00",
+  "injection": {
+    "baseline_failure_probability": 0.025,
+    "anomaly_failure_probability": 0.4,
+    "scope": "北京支付尝试记录；仅该三小时窗口内的终态尝试改变失败概率"
+  },
+  "expected_root_cause": "合成路由策略发布提高北京银联通道优先级及超时重试上限，造成上游超时增加。该标签只用于离线评测；Agent 回答必须依赖可见指标、事故记录、变更记录和文档，不能读取本文件。",
+  "expected_event_ids": [
+    "CHG-20250121-BJ-ROUTE-01",
+    "INC-20250121-BJ-01"
+  ],
+  "expected_document_ids": [
+    "DOC-ROUTE-001",
+    "DOC-GW-001",
+    "DOC-BJ-001"
+  ],
+  "causal_evidence_limit": "目前合成源记录提供时间关联、超时症状和配置背景，不提供足以独立验证根因的逐笔响应码、日志或对照实验。正确报告应将根因保留为假设。"
+}
