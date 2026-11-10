@@ -1,13 +1,13 @@
+import hashlib
 import re
 from dataclasses import dataclass
-from datetime import datetime
 from threading import RLock
 from typing import Any
 from uuid import uuid4
 
 import jieba
 from rank_bm25 import BM25Okapi
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -98,7 +98,7 @@ class KnowledgeService:
         self.engine = engine
         self.statement_timeout_ms = statement_timeout_ms
         self._cache_lock = RLock()
-        self._cache_signature: tuple[int, datetime | None] | None = None
+        self._cache_signature: str | None = None
         self._retriever: BM25Retriever | None = None
 
     def refresh_index(self) -> int:
@@ -112,12 +112,6 @@ class KnowledgeService:
         with self._cache_lock:
             try:
                 with readonly_transaction(self.engine, self.statement_timeout_ms) as connection:
-                    count, updated_at = connection.execute(
-                        select(func.count(Document.document_id), func.max(Document.updated_at))
-                    ).one()
-                    signature = (int(count), updated_at)
-                    if signature == self._cache_signature and self._retriever is not None:
-                        return self._retriever
                     rows = (
                         connection.execute(
                             select(
@@ -131,6 +125,16 @@ class KnowledgeService:
                     )
             except SQLAlchemyError as error:
                 raise translate_database_error(error) from error
+
+            digest = hashlib.sha256()
+            for row in rows:
+                for field in (row["document_id"], row["title"], row["content"]):
+                    encoded = str(field).encode("utf-8")
+                    digest.update(len(encoded).to_bytes(8, "big"))
+                    digest.update(encoded)
+            signature = digest.hexdigest()
+            if signature == self._cache_signature and self._retriever is not None:
+                return self._retriever
 
             chunks = [
                 chunk

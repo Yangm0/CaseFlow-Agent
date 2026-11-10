@@ -12,6 +12,7 @@ from pydantic import (
 )
 
 RegionName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+EvidenceID = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
 REGION_ALIASES = {
     "beijing": "北京",
     "shanghai": "上海",
@@ -105,8 +106,14 @@ class Hypothesis(BaseModel):
     citations: list[EvidenceQuote] = Field(default_factory=list, max_length=5)
 
 
+class SynthesisHypothesis(BaseModel):
+    statement: str = Field(min_length=4, max_length=700)
+    confidence: Literal["low", "medium", "high"] = "low"
+    evidence_ids: list[EvidenceID] = Field(default_factory=list, max_length=5)
+
+
 class SynthesisDraft(BaseModel):
-    hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=5)
+    hypotheses: list[SynthesisHypothesis] = Field(default_factory=list, max_length=5)
     uncertainties: list[str] = Field(default_factory=list, max_length=8)
     recommendations: list[str] = Field(default_factory=list, max_length=8)
 
@@ -145,10 +152,19 @@ class TokenUsageSummary(BaseModel):
 class CitationValidationSummary(BaseModel):
     hypotheses_received: int = Field(default=0, ge=0)
     hypotheses_kept: int = Field(default=0, ge=0)
+    hypotheses_without_evidence: int = Field(default=0, ge=0)
     citations_received: int = Field(default=0, ge=0)
     citations_kept: int = Field(default=0, ge=0)
     citations_rejected: int = Field(default=0, ge=0)
+    evidence_ids_resolved: int = Field(default=0, ge=0)
+    evidence_ids_unresolved: int = Field(default=0, ge=0)
+    evidence_ids_not_presented_rejected: int = Field(default=0, ge=0)
     duplicate_citations_removed: int = Field(default=0, ge=0)
+    unknown_evidence_ids_rejected: int = Field(default=0, ge=0)
+    numeric_claims_rejected: int = Field(default=0, ge=0)
+    quote_fidelity_checks: int = Field(default=0, ge=0)
+    quote_fidelity_failures: int = Field(default=0, ge=0)
+    semantic_support_ungraded: int = Field(default=0, ge=0)
 
 
 class MetricEvidence(BaseModel):

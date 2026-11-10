@@ -24,6 +24,7 @@ from caseflow.schemas import (
     MetricEvidence,
     ModelCallTrace,
     SynthesisDraft,
+    SynthesisHypothesis,
     TokenUsageSummary,
     ToolTrace,
     canonical_region,
@@ -48,8 +49,9 @@ related changes, unless the user explicitly restricts the request to the exact w
 
 SYNTHESIS_SYSTEM_PROMPT = """Synthesize a concise Chinese investigation draft from supplied
 evidence only. Return hypotheses, uncertainties, and safe next-step recommendations. Hypotheses must
-be explicitly tentative, not assert causation as fact, and cite exact quotations copied
-verbatim from supplied evidence. Every quote must be a contiguous substring of its cited source.
+be explicitly tentative, not assert causation as fact, and cite only stable evidence_id values from
+the supplied evidence catalog. Do not produce quote text, invent IDs, or merge sources into one
+citation. The server resolves each selected ID to its exact source text.
 Do not repeat numeric measurements in prose; the server builds statistical facts from query results.
 Recommendations are proposals only; no action has been carried out. Do not infer a root cause from
 time overlap.
@@ -242,13 +244,19 @@ class OfflineFakeModel:
         )
         if metric_item is None and self._looks_like_metrics_question(question):
             region, start_at, end_at = self._parse_question(question)
+            group_by = (
+                ["status"]
+                if "状态" in question
+                and not any(term in question for term in ("按服务", "服务分组"))
+                else ["service_name", "status"]
+            )
             return self._call(
                 "query_payment_metrics",
                 {
                     "region": region,
                     "start_at": start_at.isoformat(),
                     "end_at": end_at.isoformat(),
-                    "group_by": ["service_name", "status"],
+                    "group_by": group_by,
                 },
             )
 
@@ -266,7 +274,25 @@ class OfflineFakeModel:
                 and valid >= 20
                 and (current - baseline >= 0.05 or current >= max(0.05, baseline * 2.0))
             )
-            if anomaly_signal and "query_change_events" not in used:
+            explicit_investigation = any(
+                word in question
+                for word in (
+                    "原因",
+                    "排查",
+                    "分析",
+                    "为什么",
+                    "变更",
+                    "事故",
+                    "文档",
+                    "建议",
+                    "处理",
+                )
+            )
+            grouped_metric_question = "分组" in question or "按状态" in question
+            investigation_requested = explicit_investigation or (
+                anomaly_signal and not grouped_metric_question
+            )
+            if anomaly_signal and investigation_requested and "query_change_events" not in used:
                 params = metric_output.get("query_parameters", {})
                 try:
                     change_start = datetime.fromisoformat(str(params.get("start_at"))) - timedelta(
@@ -284,10 +310,7 @@ class OfflineFakeModel:
                         "end_at": params.get("end_at"),
                     },
                 )
-            if "search_knowledge" not in used and (
-                anomaly_signal
-                or any(word in question for word in ("建议", "怎么", "原因", "排查", "处理"))
-            ):
+            if "search_knowledge" not in used and investigation_requested:
                 context = " ".join(
                     str(event.get("summary", "")) for event in self._events(tool_results)
                 )
@@ -298,44 +321,42 @@ class OfflineFakeModel:
         return AIMessage(content="")
 
     def synthesize(self, question: str, evidence: list[dict[str, Any]]) -> SynthesisDraft:
-        changes = [
-            item
-            for source in evidence
-            for item in source.get("events", [])
-            if item.get("event_type") in ("change", "incident")
-        ]
-        documents = [item for source in evidence for item in source.get("documents", [])]
-        hypotheses: list[Hypothesis] = []
-        change = next((item for item in changes if item.get("event_type") == "change"), None)
-        incident = next((item for item in changes if item.get("event_type") == "incident"), None)
+        events = [item for item in evidence if item.get("source_type") == "event"]
+        documents = [item for item in evidence if item.get("source_type") == "document"]
+        hypotheses: list[SynthesisHypothesis] = []
+        change = next(
+            (item for item in events if item.get("source", {}).get("event_type") == "change"),
+            None,
+        )
+        incident = next(
+            (item for item in events if item.get("source", {}).get("event_type") == "incident"),
+            None,
+        )
         document = next(
             (
                 item
                 for item in documents
-                if "路由" in str(item.get("text", "")) or "超时" in str(item.get("text", ""))
+                if "路由" in str(item.get("source", {}).get("text", ""))
+                or "超时" in str(item.get("source", {}).get("text", ""))
             ),
             None,
         )
-        change_text = str(change.get("summary", "")) if change else ""
-        document_text = str(document.get("text", "")) if document else ""
+        change_text = str(change.get("source", {}).get("summary", "")) if change else ""
+        document_text = str(document.get("source", {}).get("text", "")) if document else ""
         if (
             change
             and document
             and ("路由" in change_text or "超时" in change_text)
             and ("路由" in document_text or "超时" in document_text)
         ):
-            citations = [
-                EvidenceQuote(evidence_id=change["evidence_id"], quote=change["summary"]),
-                EvidenceQuote(evidence_id=document["evidence_id"], quote=document["text"][:160]),
-            ]
             hypotheses.append(
-                Hypothesis(
+                SynthesisHypothesis(
                     statement=(
                         "路由优先级或超时重试配置可能是本次波动的调查方向；目前只有时间线和操作手册线索，"
                         "不足以确认因果关系。"
                     ),
                     confidence="low",
-                    citations=citations,
+                    evidence_ids=[change["evidence_id"], document["evidence_id"]],
                 )
             )
         uncertainties = [
@@ -959,7 +980,8 @@ class InvestigationAgent:
 
     def _finalize(self, state: AgentState) -> dict[str, Any]:
         evidence = self._synthesis_evidence(state.get("tool_results", []))
-        source_text = self._source_text_map(state.get("tool_results", []))
+        source_text = self._source_text_map(evidence)
+        tool_evidence_ids = self._available_evidence_ids(state.get("tool_results", []))
         if not source_text:
             direct_answer = state.get("direct_answer")
             uncertainty = (
@@ -1039,51 +1061,82 @@ class InvestigationAgent:
         citation_stats = {
             "hypotheses_received": len(draft.hypotheses),
             "hypotheses_kept": 0,
+            "hypotheses_without_evidence": 0,
             "citations_received": 0,
             "citations_kept": 0,
             "citations_rejected": 0,
+            "evidence_ids_resolved": 0,
+            "evidence_ids_unresolved": 0,
+            "evidence_ids_not_presented_rejected": 0,
             "duplicate_citations_removed": 0,
+            "unknown_evidence_ids_rejected": 0,
+            "numeric_claims_rejected": 0,
+            "quote_fidelity_checks": 0,
+            "quote_fidelity_failures": 0,
+            "semantic_support_ungraded": 0,
         }
         for hypothesis in draft.hypotheses:
-            citation_stats["citations_received"] += len(hypothesis.citations)
-            if not hypothesis.citations:
+            citation_stats["citations_received"] += len(hypothesis.evidence_ids)
+            if not hypothesis.evidence_ids:
+                citation_stats["hypotheses_without_evidence"] += 1
                 invalid_hypothesis_count += 1
                 continue
-            unique_citations: list[EvidenceQuote] = []
-            seen_citations: set[tuple[str, str]] = set()
-            for citation in hypothesis.citations:
-                key = (citation.evidence_id, citation.quote)
-                if key not in seen_citations:
-                    unique_citations.append(citation)
-                    seen_citations.add(key)
-            citation_stats["duplicate_citations_removed"] += len(hypothesis.citations) - len(
-                unique_citations
+            unique_ids = list(dict.fromkeys(hypothesis.evidence_ids))
+            citation_stats["duplicate_citations_removed"] += len(hypothesis.evidence_ids) - len(
+                unique_ids
             )
-            citation_ok = all(
-                citation.evidence_id in source_text
-                and citation.quote in source_text[citation.evidence_id]
-                for citation in unique_citations
-            )
+            unknown_ids = [
+                evidence_id for evidence_id in unique_ids if evidence_id not in source_text
+            ]
+            not_presented_ids = [
+                evidence_id for evidence_id in unknown_ids if evidence_id in tool_evidence_ids
+            ]
+            invented_ids = [
+                evidence_id for evidence_id in unknown_ids if evidence_id not in tool_evidence_ids
+            ]
+            known_ids = [evidence_id for evidence_id in unique_ids if evidence_id in source_text]
+            citation_stats["evidence_ids_resolved"] += len(known_ids)
+            citation_stats["evidence_ids_unresolved"] += len(unknown_ids)
+            citations: list[EvidenceQuote] = []
+            quote_fidelity_ok = True
+            for evidence_id in known_ids:
+                source = source_text[evidence_id]
+                quote = source[:600]
+                citation_stats["quote_fidelity_checks"] += 1
+                if quote not in source:
+                    citation_stats["quote_fidelity_failures"] += 1
+                    quote_fidelity_ok = False
+                else:
+                    citations.append(EvidenceQuote(evidence_id=evidence_id, quote=quote))
             claim_numbers = re.findall(r"(?<![\w])\d+(?:\.\d+)?%?", hypothesis.statement)
-            cited_text = " ".join(citation.quote for citation in unique_citations)
-            citation_ok = citation_ok and all(
+            cited_text = " ".join(citation.quote for citation in citations)
+            numeric_ok = all(
                 re.search(rf"(?<!\d){re.escape(number.rstrip('%'))}(?!\d)", cited_text)
                 for number in claim_numbers
             )
+            citation_ok = not unknown_ids and numeric_ok and quote_fidelity_ok
             if citation_ok:
                 citation_stats["hypotheses_kept"] += 1
-                citation_stats["citations_kept"] += len(unique_citations)
+                citation_stats["citations_kept"] += len(citations)
+                citation_stats["semantic_support_ungraded"] += 1
                 valid_hypotheses.append(
-                    hypothesis.model_copy(update={"citations": unique_citations})
+                    Hypothesis(
+                        statement=hypothesis.statement,
+                        confidence=hypothesis.confidence,
+                        citations=citations,
+                    )
                 )
             else:
-                citation_stats["citations_rejected"] += len(unique_citations)
+                citation_stats["citations_rejected"] += len(unique_ids)
+                citation_stats["unknown_evidence_ids_rejected"] += len(invented_ids)
+                citation_stats["evidence_ids_not_presented_rejected"] += len(not_presented_ids)
+                citation_stats["numeric_claims_rejected"] += int(not numeric_ok)
                 invalid_hypothesis_count += 1
         uncertainties = list(draft.uncertainties)
         uncertainties = [item for item in uncertainties if not re.search(r"\d", item)]
         recommendations = [item for item in draft.recommendations if not re.search(r"\d", item)]
         if invalid_hypothesis_count:
-            uncertainties.append("有假设因引用 ID 或逐字证据片段未通过校验而被移除。")
+            uncertainties.append("有假设因证据 ID 不存在、数字缺少证据或未提供引用而被移除。")
 
         state = {**state, "citation_validation": citation_stats}
         report = self._compile_report(state, valid_hypotheses, uncertainties, recommendations)
@@ -1292,7 +1345,7 @@ class InvestigationAgent:
     @staticmethod
     def _synthesis_evidence(tool_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         evidence: list[dict[str, Any]] = []
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         total_chars = 0
         max_chars = 14_000
         for item in tool_results:
@@ -1300,86 +1353,126 @@ class InvestigationAgent:
                 continue
             output = item.get("output", {})
             if item.get("tool_name") == "query_payment_metrics":
-                metric = {
-                    key: output.get(key)
-                    for key in (
-                        "evidence_id",
-                        "query_parameters",
-                        "metrics",
-                        "baseline",
-                        "calculation",
-                    )
-                    if key in output
+                baseline = output.get("baseline", {})
+                parameters = output.get("query_parameters", {})
+                source = {
+                    "query_parameters": {
+                        key: parameters.get(key)
+                        for key in (
+                            "region",
+                            "start_at",
+                            "end_at",
+                            "time_zone",
+                            "interval_semantics",
+                        )
+                        if key in parameters
+                    },
+                    "metrics": output.get("metrics", {}),
+                    "baseline": {
+                        key: baseline.get(key)
+                        for key in (
+                            "method",
+                            "valid_attempts",
+                            "failed_attempts",
+                            "failure_rate",
+                        )
+                        if key in baseline
+                    },
                 }
-                if metric:
-                    encoded = json.dumps(metric, ensure_ascii=False, default=str)
-                    if len(encoded) <= max_chars - total_chars:
-                        evidence.append({"metrics": metric})
-                        total_chars += len(encoded)
+                evidence_id = str(output.get("evidence_id", ""))
+                record = {
+                    "evidence_id": evidence_id,
+                    "source_type": "metric",
+                    "title": "Payment metrics",
+                    "source": source,
+                }
+                encoded = json.dumps(record, ensure_ascii=False, default=str)
+                if (
+                    evidence_id
+                    and evidence_id not in seen
+                    and len(encoded) <= max_chars - total_chars
+                ):
+                    evidence.append(record)
+                    seen.add(evidence_id)
+                    total_chars += len(encoded)
             elif item.get("tool_name") == "search_knowledge":
                 for result in output.get("results", [])[:5]:
                     evidence_id = str(result.get("evidence_id", ""))
-                    key = ("document", evidence_id)
-                    if not evidence_id or key in seen:
+                    if not evidence_id or evidence_id in seen:
                         continue
-                    compact = {
+                    record = {
                         "evidence_id": evidence_id,
+                        "source_type": "document",
                         "title": str(result.get("title", ""))[:240],
-                        "text": str(result.get("text", ""))[:1200],
+                        "source": {"text": str(result.get("text", ""))},
                     }
-                    encoded = json.dumps(compact, ensure_ascii=False, default=str)
+                    encoded = json.dumps(record, ensure_ascii=False, default=str)
                     if len(encoded) > max_chars - total_chars:
                         continue
-                    evidence.append({"documents": [compact]})
-                    seen.add(key)
+                    evidence.append(record)
+                    seen.add(evidence_id)
                     total_chars += len(encoded)
             elif item.get("tool_name") == "query_change_events":
                 for result in output.get("events", [])[:12]:
                     evidence_id = str(result.get("evidence_id", ""))
-                    key = ("event", evidence_id)
-                    if not evidence_id or key in seen:
+                    if not evidence_id or evidence_id in seen:
                         continue
-                    compact = {
+                    record = {
                         "evidence_id": evidence_id,
-                        "event_type": result.get("event_type"),
-                        "occurred_at": result.get("occurred_at"),
-                        "region": result.get("region"),
-                        "service_name": result.get("service_name"),
-                        "summary": str(result.get("summary", ""))[:500],
-                        "status": result.get("status"),
+                        "source_type": "event",
+                        "title": f"{result.get('event_type', 'event')} event",
+                        "source": {
+                            "event_type": result.get("event_type"),
+                            "occurred_at": result.get("occurred_at"),
+                            "region": result.get("region"),
+                            "service_name": result.get("service_name"),
+                            "summary": str(result.get("summary", ""))[:500],
+                            "status": result.get("status"),
+                        },
                     }
-                    encoded = json.dumps(compact, ensure_ascii=False, default=str)
+                    encoded = json.dumps(record, ensure_ascii=False, default=str)
                     if len(encoded) > max_chars - total_chars:
                         continue
-                    evidence.append({"events": [compact]})
-                    seen.add(key)
+                    evidence.append(record)
+                    seen.add(evidence_id)
                     total_chars += len(encoded)
         return evidence
 
     @staticmethod
-    def _source_text_map(tool_results: list[dict[str, Any]]) -> dict[str, str]:
+    def _source_text_map(evidence: list[dict[str, Any]]) -> dict[str, str]:
         source_map: dict[str, str] = {}
+        for item in evidence:
+            evidence_id = str(item.get("evidence_id", ""))
+            source = item.get("source", {})
+            if not evidence_id or not isinstance(source, dict):
+                continue
+            if item.get("source_type") == "document":
+                source_map[evidence_id] = str(source.get("text", ""))
+            elif item.get("source_type") == "event":
+                source_map[evidence_id] = str(source.get("summary", ""))
+            elif item.get("source_type") == "metric":
+                source_map[evidence_id] = json.dumps(
+                    source, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+        return source_map
+
+    @staticmethod
+    def _available_evidence_ids(tool_results: list[dict[str, Any]]) -> set[str]:
+        evidence_ids: set[str] = set()
         for item in tool_results:
             if item.get("error"):
                 continue
             output = item.get("output", {})
-            if item.get("tool_name") == "search_knowledge":
-                for result in output.get("results", []):
-                    source_map[str(result["evidence_id"])] = str(result["text"])
-            elif item.get("tool_name") == "query_change_events":
-                for result in output.get("events", []):
-                    source_map[str(result["evidence_id"])] = str(result["summary"])
-            elif item.get("tool_name") == "query_payment_metrics":
-                source_map[str(output["evidence_id"])] = json.dumps(
-                    {
-                        "query_parameters": output["query_parameters"],
-                        "metrics": output["metrics"],
-                        "baseline": output["baseline"],
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
+            direct_id = output.get("evidence_id")
+            if direct_id:
+                evidence_ids.add(str(direct_id))
+            for key in ("results", "events"):
+                evidence_ids.update(
+                    str(result["evidence_id"])
+                    for result in output.get(key, [])
+                    if isinstance(result, dict) and result.get("evidence_id")
                 )
-        return source_map
+        return evidence_ids
 
     @staticmethod
     def _operations(traces: list[dict[str, Any]]) -> list[str]:

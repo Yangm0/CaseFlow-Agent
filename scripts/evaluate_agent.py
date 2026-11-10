@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -32,6 +33,7 @@ DEFAULT_CASE_IDS = (
     "direct-no-tool-01",
     "prompt-injection-01",
 )
+ALLOWED_TOOLS = {"query_payment_metrics", "query_change_events", "search_knowledge"}
 MODEL_ID_PATTERN = re.compile(r"\b(?:KNOW|MET|CHANGE|INCIDENT)-[A-Za-z0-9_-]+\b")
 DATE_PATTERN = re.compile(
     r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}"
@@ -47,6 +49,15 @@ def load_cases() -> dict[str, dict[str, Any]]:
         content = json.loads((ROOT / "evals" / filename).read_text(encoding="utf-8"))
         cases.update({item["case_id"]: item for item in content})
     return cases
+
+
+def load_evaluation_labels() -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    content = json.loads((ROOT / "evals" / "evaluation_labels.json").read_text(encoding="utf-8"))
+    split_by_case = {
+        case_id: split for split, case_ids in content["splits"].items() for case_id in case_ids
+    }
+    labels = {item["case_id"]: item for item in content["task_success"]}
+    return split_by_case, labels
 
 
 def numeric_values(text: str) -> list[Decimal]:
@@ -93,7 +104,6 @@ def source_text_from_report(report: dict[str, Any]) -> str:
     events = report.get("system_events", [])
     return json.dumps(
         {
-            "question": report.get("question", ""),
             "statistical_facts": facts,
             "documents": documents,
             "events": events,
@@ -126,6 +136,7 @@ def run_direct(model: ChatOpenAI, question: str) -> dict[str, Any]:
         response = model.invoke(messages)
     except Exception as error:
         return {
+            "execution_completed": False,
             "status": "failed",
             "error_code": _model_error_code(error, "decision"),
             "answer": "",
@@ -134,6 +145,7 @@ def run_direct(model: ChatOpenAI, question: str) -> dict[str, Any]:
         }
     content = _content_text(response.content)
     return {
+        "execution_completed": bool(content.strip()),
         "status": "completed" if content.strip() else "failed",
         "answer": content,
         "elapsed_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
@@ -164,6 +176,7 @@ def run_rag(model: ChatOpenAI, search_tool: Any, question: str) -> dict[str, Any
         )
     except Exception as error:
         return {
+            "execution_completed": False,
             "status": "failed",
             "error_code": _model_error_code(error, "synthesis"),
             "answer": "",
@@ -175,6 +188,7 @@ def run_rag(model: ChatOpenAI, search_tool: Any, question: str) -> dict[str, Any
     cited_ids = re.findall(r"\[(KNOW-[A-Za-z0-9_-]+)\]", content)
     retrieved_ids = {str(item.get("evidence_id")) for item in docs}
     return {
+        "execution_completed": bool(content.strip()),
         "status": "completed" if content.strip() else "failed",
         "answer": content,
         "elapsed_ms": int((datetime.now(UTC) - started).total_seconds() * 1000),
@@ -193,6 +207,7 @@ def run_full(client: TestClient, question: str) -> dict[str, Any]:
         response = client.post("/api/v1/investigations", json={"question": question})
     except Exception:
         return {
+            "execution_completed": False,
             "status": "failed",
             "error_code": "API_REQUEST_FAILED",
             "answer": "",
@@ -203,6 +218,7 @@ def run_full(client: TestClient, question: str) -> dict[str, Any]:
     elapsed = int((datetime.now(UTC) - started).total_seconds() * 1000)
     if response.status_code != 200:
         return {
+            "execution_completed": False,
             "status": "failed",
             "error_code": f"API_HTTP_{response.status_code}",
             "answer": "",
@@ -211,18 +227,102 @@ def run_full(client: TestClient, question: str) -> dict[str, Any]:
             "tool_calls": [],
         }
     report = response.json()
+    report["execution_completed"] = True
     report["question"] = question
     report["answer"] = report_text(report)
     report["elapsed_ms"] = elapsed
-    report["source_text"] = source_text_from_report(report) + question
+    report["source_text"] = source_text_from_report(report)
     report["tool_calls"] = report.get("tool_calls", [])
     report["token_usage"] = report.get("token_usage")
     return report
 
 
-def grade_case(condition: str, case: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+def _matches_subset(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and all(
+            key in actual and _matches_subset(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return isinstance(actual, list) and all(
+            any(_matches_subset(candidate, expected_item) for candidate in actual)
+            for expected_item in expected
+        )
+    if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+        return isinstance(actual, (int, float)) and math.isclose(
+            float(actual), float(expected), rel_tol=1e-8, abs_tol=1e-9
+        )
+    return actual == expected
+
+
+def _task_success_checks(
+    condition: str,
+    case: dict[str, Any],
+    result: dict[str, Any],
+    checks: list[dict[str, Any]],
+    selection_exact: bool | None,
+    argument_match_rate: float | None,
+    ungrounded_numbers: list[str],
+    answer: str,
+) -> list[dict[str, Any]]:
+    report = result
+    actual_tools = [str(item.get("tool_name", "")) for item in report.get("tool_calls", [])]
+    reported_event_ids = {str(item.get("event_id", "")) for item in report.get("system_events", [])}
+    reported_document_ids = {
+        str(item.get("document_id", "")) for item in report.get("document_evidence", [])
+    }
+    outcomes: list[dict[str, Any]] = []
+    for check in checks:
+        kind = check["type"]
+        if kind == "tool_selection_exact":
+            passed = selection_exact is True
+        elif kind == "tool_arguments_exact":
+            passed = argument_match_rate is not None and argument_match_rate == 1.0
+        elif kind == "metrics_match":
+            expected = check["expected"]
+            passed = any(
+                _matches_subset(item, expected) for item in report.get("statistical_facts", [])
+            )
+        elif kind == "event_ids_present":
+            passed = set(check["expected"]).issubset(reported_event_ids)
+        elif kind == "document_ids_present":
+            passed = set(check["expected"]).issubset(reported_document_ids)
+        elif kind == "document_any_id_present":
+            passed = bool(set(check["expected"]).intersection(reported_document_ids))
+        elif kind == "no_ungrounded_numbers":
+            passed = not ungrounded_numbers
+        elif kind == "read_only_tools_only":
+            passed = set(actual_tools).issubset(ALLOWED_TOOLS)
+        elif kind == "no_tool_calls":
+            passed = not actual_tools
+        elif kind == "direct_answer_present":
+            passed = bool(str(report.get("direct_answer") or "").strip())
+        elif kind == "answer_contains_all":
+            passed = all(str(term).casefold() in answer.casefold() for term in check["terms"])
+        elif kind == "forbidden_strings_absent":
+            passed = all(str(term).casefold() not in answer.casefold() for term in check["terms"])
+        elif kind == "all_tools_succeeded":
+            calls = report.get("tool_calls", [])
+            passed = bool(calls) and all(item.get("status") == "succeeded" for item in calls)
+        elif kind == "invalid_request_safely_handled":
+            calls = report.get("tool_calls", [])
+            passed = all(item.get("status") in {"failed", "skipped"} for item in calls)
+        elif kind == "status_is":
+            passed = report.get("status") == check["expected"]
+        else:
+            passed = False
+        outcomes.append({"check": kind, "passed": bool(passed)})
+    return outcomes
+
+
+def grade_case(
+    condition: str,
+    case: dict[str, Any],
+    result: dict[str, Any],
+    evaluation_split: str,
+    task_success_label: dict[str, Any] | None,
+) -> dict[str, Any]:
     answer = str(result.get("answer", ""))
-    source_text = str(result.get("source_text", case["question"]))
+    source_text = str(result.get("source_text", ""))
     ungrounded = ungrounded_numbers(answer, source_text)
     tools = result.get("tool_calls", [])
     actual_tools = [str(item.get("tool_name", "")) for item in tools]
@@ -235,12 +335,23 @@ def grade_case(condition: str, case: dict[str, Any], result: dict[str, Any]) -> 
         received = int(citations.get("citations_received", 0))
         accepted = int(citations.get("citations_kept", 0))
         rejected = int(citations.get("citations_rejected", 0))
-        citation_validity = accepted / (accepted + rejected) if accepted + rejected else None
+        resolved = int(citations.get("evidence_ids_resolved", 0))
+        unresolved = int(citations.get("evidence_ids_unresolved", 0))
+        source_validity = resolved / (resolved + unresolved) if resolved + unresolved else None
+        quote_checks = int(citations.get("quote_fidelity_checks", 0))
+        quote_failures = int(citations.get("quote_fidelity_failures", 0))
+        quote_fidelity = (quote_checks - quote_failures) / quote_checks if quote_checks else None
+        citation_acceptance = accepted / (accepted + rejected) if accepted + rejected else None
         citation_count = received
     else:
         cited = result.get("cited_ids", [])
         valid = result.get("valid_cited_ids", [])
-        citation_validity = len(valid) / len(cited) if cited else None
+        source_validity = len(valid) / len(cited) if cited else None
+        quote_fidelity = None
+        citation_acceptance = source_validity
+        resolved = len(valid)
+        unresolved = len(cited) - len(valid)
+        quote_checks = quote_failures = 0
         citation_count = len(cited)
     expected_tools = list(case.get("expected_tools", []))
     selection_exact = actual_tools == expected_tools if condition == "full_agent" else None
@@ -272,6 +383,24 @@ def grade_case(condition: str, case: dict[str, Any], result: dict[str, Any]) -> 
         argument_matches.append(matched)
     argument_match_rate = mean(argument_matches) if argument_matches else None
     status = str(result.get("status", "failed"))
+    task_checks = _task_success_checks(
+        condition,
+        case,
+        result,
+        list((task_success_label or {}).get("checks", [])),
+        selection_exact,
+        argument_match_rate,
+        ungrounded,
+        answer,
+    )
+    check_failures = [item["check"] for item in task_checks if not item["passed"]]
+    ungraded_requirements = list((task_success_label or {}).get("ungraded_requirements", []))
+    if check_failures:
+        task_success_status = "failed"
+    elif not task_checks or ungraded_requirements:
+        task_success_status = "ungraded"
+    else:
+        task_success_status = "passed"
     error_detail = result.get("error") or {}
     bad_reasons: list[str] = []
     if status != "completed":
@@ -280,13 +409,15 @@ def grade_case(condition: str, case: dict[str, Any], result: dict[str, Any]) -> 
         bad_reasons.append("tool_selection_mismatch")
     if argument_match_rate is not None and argument_match_rate < 1:
         bad_reasons.append("tool_argument_mismatch")
-    if citation_validity is not None and citation_validity < 1:
+    if citation_acceptance is not None and citation_acceptance < 1:
         bad_reasons.append("invalid_citation")
     if ungrounded:
         bad_reasons.append("ungrounded_numeric_claim")
     return {
         "case_id": case["case_id"],
         "category": case["category"],
+        "evaluation_split": evaluation_split,
+        "execution_completed": bool(result.get("execution_completed", False)),
         "status": status,
         "expected_tools": expected_tools,
         "actual_tools": actual_tools,
@@ -294,9 +425,41 @@ def grade_case(condition: str, case: dict[str, Any], result: dict[str, Any]) -> 
         "tool_argument_schema_valid_rate": argument_valid_rate,
         "tool_argument_match_rate": argument_match_rate,
         "tool_argument_checks_scored": len(argument_checks),
+        "tool_argument_matches_count": sum(argument_matches),
+        "tool_calls_succeeded": valid_args,
         "actual_tool_arguments": actual_tool_arguments,
         "citation_count": citation_count,
-        "citation_validity": citation_validity,
+        "evidence_source_validity": source_validity,
+        "evidence_ids_resolved": resolved,
+        "evidence_ids_unresolved": unresolved,
+        "quote_fidelity": quote_fidelity,
+        "quote_fidelity_checks": quote_checks,
+        "quote_fidelity_failures": quote_failures,
+        "citation_acceptance": citation_acceptance,
+        "citation_candidates": accepted + rejected if condition == "full_agent" else citation_count,
+        "citations_kept": accepted
+        if condition == "full_agent"
+        else len(result.get("valid_cited_ids", [])),
+        "citations_rejected": rejected
+        if condition == "full_agent"
+        else citation_count - len(result.get("valid_cited_ids", [])),
+        "citation_rejections_by_reason": {
+            "hypotheses_without_evidence": int(citations.get("hypotheses_without_evidence", 0)),
+            "unknown_evidence_ids": int(citations.get("unknown_evidence_ids_rejected", 0)),
+            "evidence_ids_not_presented": int(
+                citations.get("evidence_ids_not_presented_rejected", 0)
+            ),
+            "unsupported_numeric_claims": int(citations.get("numeric_claims_rejected", 0)),
+            "duplicate_ids_removed": int(citations.get("duplicate_citations_removed", 0)),
+            "quote_fidelity_failures": int(citations.get("quote_fidelity_failures", 0)),
+            "semantic_support_ungraded": int(citations.get("semantic_support_ungraded", 0)),
+        },
+        "semantic_entailment": "ungraded",
+        "answer_correctness": "ungraded",
+        "task_success_status": task_success_status,
+        "task_success_checks": task_checks,
+        "task_success_ungraded_requirements": ungraded_requirements,
+        "task_success_failed_checks": check_failures,
         "ungrounded_numbers": ungrounded,
         "tool_call_count": attempted,
         "elapsed_ms": int(result.get("elapsed_ms", 0)),
@@ -313,19 +476,44 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     scored_selections = [
         row["tool_selection_exact"] for row in rows if row["tool_selection_exact"] is not None
     ]
-    arg_rates = [
-        row["tool_argument_schema_valid_rate"]
-        for row in rows
-        if row["tool_argument_schema_valid_rate"] is not None
-    ]
     argument_match_rates = [
         row["tool_argument_match_rate"]
         for row in rows
         if row["tool_argument_match_rate"] is not None
     ]
-    citation_rates = [
-        row["citation_validity"] for row in rows if row["citation_validity"] is not None
-    ]
+    source_id_total = sum(
+        row["evidence_ids_resolved"] + row["evidence_ids_unresolved"] for row in rows
+    )
+    source_id_valid = sum(row["evidence_ids_resolved"] for row in rows)
+    quote_checks = sum(row["quote_fidelity_checks"] for row in rows)
+    quote_failures = sum(row["quote_fidelity_failures"] for row in rows)
+    tool_argument_check_count = sum(row["tool_argument_checks_scored"] for row in rows)
+    tool_argument_match_count = sum(row["tool_argument_matches_count"] for row in rows)
+    tool_call_count = sum(row["tool_call_count"] for row in rows)
+    tool_calls_succeeded = sum(row["tool_calls_succeeded"] for row in rows)
+    selection_denominator = len(scored_selections)
+    selection_numerator = sum(value is True for value in scored_selections)
+    task_success_passed = sum(row["task_success_status"] == "passed" for row in rows)
+    task_success_failed = sum(row["task_success_status"] == "failed" for row in rows)
+    task_success_graded = task_success_passed + task_success_failed
+    execution_completed = sum(row["execution_completed"] for row in rows)
+    completed_status = sum(row["status"] == "completed" for row in rows)
+    citation_candidates = sum(row["citation_candidates"] for row in rows)
+    citations_kept = sum(row["citations_kept"] for row in rows)
+    citations_rejected = sum(row["citations_rejected"] for row in rows)
+    rejection_keys = (
+        "hypotheses_without_evidence",
+        "unknown_evidence_ids",
+        "evidence_ids_not_presented",
+        "unsupported_numeric_claims",
+        "duplicate_ids_removed",
+        "quote_fidelity_failures",
+        "semantic_support_ungraded",
+    )
+    citation_diagnostics = {
+        key: sum(row["citation_rejections_by_reason"][key] for row in rows)
+        for key in rejection_keys
+    }
     usages = [row["token_usage"] for row in rows]
     tokens_available = bool(usages) and all(
         isinstance(item, dict)
@@ -335,12 +523,68 @@ def aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
     )
     return {
         "case_count": len(rows),
-        "completion_rate": mean(row["status"] == "completed" for row in rows) if rows else 0,
-        "tool_selection_exact_rate": mean(scored_selections) if scored_selections else None,
-        "tool_argument_schema_valid_rate": mean(arg_rates) if arg_rates else None,
-        "tool_argument_match_rate": mean(argument_match_rates) if argument_match_rates else None,
-        "tool_argument_cases_scored": len(argument_match_rates),
-        "citation_validity_rate": mean(citation_rates) if citation_rates else None,
+        "execution_completion": {
+            "numerator": execution_completed,
+            "denominator": len(rows),
+            "rate": execution_completed / len(rows) if rows else None,
+        },
+        "completed_report_status": {
+            "numerator": completed_status,
+            "denominator": len(rows),
+            "rate": completed_status / len(rows) if rows else None,
+        },
+        "tool_selection_accuracy": {
+            "numerator": selection_numerator,
+            "denominator": selection_denominator,
+            "rate": selection_numerator / selection_denominator if selection_denominator else None,
+        },
+        "tool_argument_schema_validity": {
+            "numerator": tool_calls_succeeded,
+            "denominator": tool_call_count,
+            "rate": tool_calls_succeeded / tool_call_count if tool_call_count else None,
+        },
+        "tool_argument_accuracy": {
+            "numerator": tool_argument_match_count,
+            "denominator": tool_argument_check_count,
+            "rate": tool_argument_match_count / tool_argument_check_count
+            if tool_argument_check_count
+            else None,
+            "cases_scored": len(argument_match_rates),
+        },
+        "evidence_source_validity": {
+            "numerator": source_id_valid,
+            "denominator": source_id_total,
+            "rate": source_id_valid / source_id_total if source_id_total else None,
+        },
+        "citation_acceptance": {
+            "numerator": citations_kept,
+            "denominator": citations_kept + citations_rejected,
+            "rate": citations_kept / (citations_kept + citations_rejected)
+            if citations_kept + citations_rejected
+            else None,
+            "candidate_count_including_duplicates": citation_candidates,
+        },
+        "citation_diagnostics": citation_diagnostics,
+        "quote_fidelity": {
+            "numerator": quote_checks - quote_failures,
+            "denominator": quote_checks,
+            "rate": (quote_checks - quote_failures) / quote_checks if quote_checks else None,
+        },
+        "semantic_entailment": {
+            "graded": 0,
+            "ungraded": sum(row["semantic_entailment"] == "ungraded" for row in rows),
+        },
+        "answer_correctness": {
+            "graded": 0,
+            "ungraded": sum(row["answer_correctness"] == "ungraded" for row in rows),
+        },
+        "task_success": {
+            "numerator": task_success_passed,
+            "denominator": task_success_graded,
+            "rate": task_success_passed / task_success_graded if task_success_graded else None,
+            "failed": task_success_failed,
+            "ungraded": sum(row["task_success_status"] == "ungraded" for row in rows),
+        },
         "ungrounded_numeric_claim_count": sum(len(row["ungrounded_numbers"]) for row in rows),
         "average_tool_calls": mean(tool_counts) if tool_counts else 0,
         "average_latency_ms": round(mean(latencies)) if latencies else 0,
@@ -379,7 +623,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description="Compare direct LLM, PostgreSQL BM25+LLM, and the full CaseFlow agent."
     )
-    parser.add_argument("--case", dest="case_ids", action="append")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--case", dest="case_ids", action="append")
+    selection.add_argument("--split", choices=("development", "validation"))
     parser.add_argument(
         "--condition",
         choices=("direct_llm", "bm25_rag", "full_agent", "all"),
@@ -415,7 +661,13 @@ def main() -> int:
         seed_engine.dispose()
         raise SystemExit("Refusing evaluation outside the isolated caseflow_test database.")
 
-    selected_ids = args.case_ids or list(DEFAULT_CASE_IDS)
+    split_by_case, task_success_labels = load_evaluation_labels()
+    if args.case_ids:
+        selected_ids = args.case_ids
+    elif args.split:
+        selected_ids = [case_id for case_id, split in split_by_case.items() if split == args.split]
+    else:
+        selected_ids = list(DEFAULT_CASE_IDS)
     case_index = load_cases()
     missing = [case_id for case_id in selected_ids if case_id not in case_index]
     if missing:
@@ -463,7 +715,17 @@ def main() -> int:
                         result = run_rag(model, tools["search_knowledge"], case["question"])
                     else:
                         result = run_full(api_client, case["question"])
-                    result_rows[condition].append(grade_case(condition, case, result))
+                    result_rows[condition].append(
+                        grade_case(
+                            condition,
+                            case,
+                            result,
+                            split_by_case.get(case["case_id"], "unassigned"),
+                            task_success_labels.get(case["case_id"])
+                            if condition == "full_agent"
+                            else None,
+                        )
+                    )
     finally:
         if fixture_id:
             remove_injection_fixture(seed_engine, fixture_id)
@@ -476,6 +738,9 @@ def main() -> int:
         "provider": "OpenRouter verified :free route",
         "database": "caseflow_test (synthetic only)",
         "case_ids": selected_ids,
+        "evaluation_splits": {
+            case_id: split_by_case.get(case_id, "unassigned") for case_id in selected_ids
+        },
         "conditions": {
             condition: {
                 "metrics": aggregate(rows),

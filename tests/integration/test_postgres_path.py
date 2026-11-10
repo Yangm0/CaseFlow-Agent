@@ -1,10 +1,10 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 
@@ -93,8 +93,9 @@ def test_postgres_seed_metrics_time_boundary_and_read_only_role(postgres_engines
 
 
 def test_postgres_bm25_and_change_queries_return_real_source_rows(postgres_engines):
-    app_engine, _ = postgres_engines
-    search = KnowledgeService(app_engine).search(
+    app_engine, seed_engine = postgres_engines
+    service = KnowledgeService(app_engine)
+    search = service.search(
         KnowledgeSearchInput(query="payment-router 路由优先级 上游超时", top_k=5)
     )
     assert search["index_size_chunks"] >= 18 and search["results"]
@@ -109,6 +110,49 @@ def test_postgres_bm25_and_change_queries_return_real_source_rows(postgres_engin
         "CHG-20250121-BJ-ROUTE-01",
         "INC-20250121-BJ-01",
     }
+
+    probe_id = f"EVAL-CACHE-{uuid4().hex[:12]}"
+    try:
+        assert not service.search(KnowledgeSearchInput(query="casecachetoken", top_k=5))["results"]
+        with seed_engine.begin() as connection:
+            connection.execute(
+                insert(Document).values(
+                    document_id=probe_id,
+                    title="Cache invalidation probe",
+                    source_type="evaluation_fixture",
+                    content="casecachetoken is available in the initial document text.",
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        inserted = service.search(KnowledgeSearchInput(query="casecachetoken", top_k=5))["results"]
+        assert any(item["document_id"] == probe_id for item in inserted)
+
+        with seed_engine.begin() as connection:
+            connection.execute(
+                update(Document)
+                .where(Document.document_id == probe_id)
+                .values(
+                    title="Cache invalidation probe",
+                    content="freshcacheword replaces the old document contents.",
+                    updated_at=datetime.now(UTC),
+                )
+            )
+        updated_old_query = service.search(KnowledgeSearchInput(query="casecachetoken", top_k=5))[
+            "results"
+        ]
+        updated_new_query = service.search(KnowledgeSearchInput(query="freshcacheword", top_k=5))[
+            "results"
+        ]
+        assert all(item["document_id"] != probe_id for item in updated_old_query)
+        assert any(item["document_id"] == probe_id for item in updated_new_query)
+
+        with seed_engine.begin() as connection:
+            connection.execute(delete(Document).where(Document.document_id == probe_id))
+        deleted = service.search(KnowledgeSearchInput(query="freshcacheword", top_k=5))["results"]
+        assert all(item["document_id"] != probe_id for item in deleted)
+    finally:
+        with seed_engine.begin() as connection:
+            connection.execute(delete(Document).where(Document.document_id == probe_id))
 
 
 @pytest.mark.e2e

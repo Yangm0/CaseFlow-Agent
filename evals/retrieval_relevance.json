@@ -1,32 +1,56 @@
 [
   {
     "query_id": "failure-rate-denominator",
+    "split": "development",
     "query": "支付失败率的分母应包含 pending 状态吗？",
     "relevant_document_ids": ["DOC-PAY-001", "DOC-PAY-002", "DOC-STATUS-001"]
   },
   {
     "query_id": "gateway-timeout",
+    "split": "development",
     "query": "网关 timeout 和 upstream unavailable 应如何排查？",
     "relevant_document_ids": ["DOC-GW-001", "DOC-TIMEOUT-001", "DOC-CAPACITY-001"]
   },
   {
     "query_id": "retry-risk",
+    "split": "development",
     "query": "支付重试上限增加有什么风险，如何检查幂等？",
     "relevant_document_ids": ["DOC-RETRY-001", "DOC-GW-001", "DOC-CAPACITY-001"]
   },
   {
     "query_id": "beijing-route-change",
+    "split": "development",
     "query": "北京支付路由优先级和通道切换需要核对什么？",
     "relevant_document_ids": ["DOC-BJ-001", "DOC-ROUTE-001", "DOC-CHANGE-001"]
   },
   {
     "query_id": "incident-report",
+    "split": "development",
     "query": "事故报告如何区分观察事实、证据和未经验证的原因？",
     "relevant_document_ids": ["DOC-REPORT-001", "DOC-INC-001", "DOC-CHANGE-001"]
   },
   {
     "query_id": "router-cache",
+    "split": "development",
     "query": "路由配置缓存刷新延迟会造成什么现象？",
     "relevant_document_ids": ["DOC-CACHE-001", "DOC-ROUTE-001", "DOC-BJ-001"]
+  },
+  {
+    "query_id": "upstream-timeout-retry",
+    "split": "validation",
+    "query": "上游响应超时和增加支付重试后应该检查哪些风险？",
+    "relevant_document_ids": ["DOC-GW-001", "DOC-RETRY-001", "DOC-CAPACITY-001"]
+  },
+  {
+    "query_id": "route-health-ambiguous",
+    "split": "validation",
+    "query": "路由问题怎么结合地区标签、健康探针和实例配置来排查？",
+    "relevant_document_ids": ["DOC-BJ-001", "DOC-ROUTE-001", "DOC-CACHE-001"]
+  },
+  {
+    "query_id": "unrelated-office-question",
+    "split": "validation",
+    "query": "办公室咖啡机需要怎样清洗和维护？",
+    "relevant_document_ids": []
   }
 ]

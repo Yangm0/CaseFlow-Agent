@@ -4,17 +4,17 @@ CaseFlow is a small, reviewable payment-incident investigation agent. It connect
 
 ## Current local verification status
 
-Verified on Windows with Python 3.13.2 on 2026-11-10:
+Verified on Windows with Python 3.13.2 on 2026-11-10 after the V1-B quality fixes:
 
 - The existing `.venv` has the project and development dependencies installed; FastAPI, LangGraph, SQLAlchemy, psycopg, jieba, and pytest import successfully. Package installation used the active v2rayN proxy without changing system-wide proxy settings.
 - Docker Desktop is running with Docker Engine 29.9.3, Compose 5.7.0, and its WSL 2 backend. PostgreSQL 17 is healthy on `127.0.0.1:5432`. The Docker CLI binary is installed in the current user's Docker Desktop directory but is not on this PowerShell session's PATH.
-- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, and 4 incidents. The test database contains no leftover evaluation-injection document. The application role can select but cannot insert, update, or delete.
-- Ruff checks pass, pytest collects exactly 8 tests, and all 8 pass against the real PostgreSQL test database.
-- A real live API smoke completed with `nvidia/nemotron-3.5-super-vl:free` through OpenRouter. It used two decision calls followed by one JSON-schema synthesis call. Tool order was `query_payment_metrics` → `query_change_events` → `search_knowledge`; all three succeeded.
-- The smoke queried Beijing on 2025-01-21 09:00–12:00: 22/50 failed (44.00%) versus 10/330 (3.03%) over seven prior matching windows. The related change at 08:52 and incident at 09:07 were returned, along with five BM25 passages. The report treats timing as a clue, not proof of cause. It retained one low-confidence hypothesis with two source-checked quotations and removed five of seven proposed citations.
-- A four-case live comparison completed for Direct LLM, PostgreSQL BM25-RAG, and the full Agent. Completion was 4/4 in each condition; full Agent tool selection was exact in 4/4 cases and all attempted tool calls executed successfully. Exact argument checks passed for the separately captured full investigation. The heuristic numeric screen found no unsupported numeric tokens; it is not a semantic fact checker. Citation candidate validity in the full Agent was 46.7%; normal and missing-evidence cases had rejected citations, which remain a known quality issue.
-- A six-query BM25 retrieval evaluation measured mean Recall@5 0.722 and MRR 1.000. Labels were set independently of rankings; every query's first result was relevant.
-- The live smoke and evaluation used only synthetic records in `caseflow_test`. The model route was checked as a zero-price `:free` route at run time; pricing and quotas can change. No paid model API was called.
+- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, and 4 incidents. The test database contains no leftover evaluation fixture. The application role can select but cannot insert, update, or delete.
+- Ruff passes, pytest collects exactly 8 tests, and all 8 pass against real PostgreSQL. The BM25 integration check inserts, updates, and deletes one uniquely named test document and confirms the cached index follows each change; it removes that row in `finally`.
+- A fresh offline end-to-end request used PostgreSQL and BM25 in `caseflow_test`: Beijing 2025-01-21 09:00–12:00 returned 22/50 failed (44.00%) versus 10/330 (3.03%), with the related change and incident. Tool order was metrics → change events → knowledge search. It retained one deterministic offline hypothesis; both server-generated citations resolved to their source and matched exact text (2/2). This offline result is not a live-model evaluation. Local trace: `.tmp/v1b_offline_qualityfix_trace.json`.
+- A separate offline metric-only case returned Shenzhen 36/2 failed (5.56%) versus 5/252 (1.98%), with both status groups. The evaluator's six deterministic checks passed (task success 1/1 for this labeled synthetic query); natural-language answer correctness remains ungraded. Local trace: `.tmp/v1b_offline_metric_validation.json`.
+- Corrected document-level retrieval evaluation covers 9 synthetic queries: 6 development and 3 validation. Recall@5 is 0.708 over 8 queries with relevant-document labels (development 0.722/6; validation 0.667/2). MRR is 0.889 over all 9 queries (development 1.000/6; validation 0.667/3). The unrelated validation query has no relevant-document denominator and still returns five documents, exposing a current BM25 abstention limitation.
+- The pre-fix Live smoke used OpenRouter `nvidia/nemotron-3.5-super-vl:free`, with 3 model calls, 20.5 s elapsed, and 8,988 tokens. It retained 2/7 proposed free-form citations (28.6%). In the four-case pre-fix comparison, the reported 46.7% was a macro-average of three citation-bearing cases (normal 2/5, missing-evidence 0/1, injection 2/2); the corresponding micro result was 4/8 (50%). These old results are explicitly pre-fix and are not a post-fix Live result.
+- A current OpenRouter preflight confirmed the configured free variant is listed at $0 prompt and completion pricing and the key is marked free tier. The key endpoint does not expose remaining free requests; its request-rate field is deprecated. Because the earlier same-day evaluations may have used a substantial part of the 50-request daily cap, no post-fix Live model request was sent while the remaining quota was unknown. No paid model API was called.
 
 ## V1-B engineering scope
 
@@ -39,7 +39,7 @@ POST /api/v1/investigations
   -> server-built statistical facts + validated citations
 ```
 
-The API report keeps statistical facts, retrieved document passages, service changes/incidents, tentative hypotheses, uncertainties, recommendations, tool traces, and operation status in separate fields. Statistical values are copied from tool output by the server. A hypothesis is retained only when its evidence ID exists and its quoted text exactly matches retrieved source content. This checks source linkage and quote fidelity; human review is still needed to judge whether a hypothesis over-interprets a quote.
+The API report keeps statistical facts, retrieved document passages, service changes/incidents, tentative hypotheses, uncertainties, recommendations, tool traces, and operation status in separate fields. Statistical values are copied from tool output by the server. During synthesis, the model selects stable IDs from a compact evidence catalog; it does not supply quote text. The server resolves each ID against the exact catalog passed to the model and constructs the quote from that source. Unknown IDs and numeric claims missing from selected evidence are rejected. This verifies source linkage and exact quote fidelity; it does not establish that the source semantically supports the hypothesis.
 
 ## Data definition
 
@@ -132,35 +132,40 @@ Integration coverage includes database connectivity, deterministic import counts
 
 ## Evaluation cases
 
-`evals/v1a_cases.json` contains the existing reference tasks; `evals/v1b_cases.json` adds direct no-tool and adversarial-document cases. `evals/ground_truth.json` is evaluator-only and is never imported into the Agent or tool prompts. The live evaluator compares Direct LLM, PostgreSQL BM25-RAG, and the full Agent on the same selected questions, and reports completion, tool selection, schema-compatible call execution, checked argument matches, citation IDs, heuristic unsupported numeric tokens, latency, tokens, and bad cases. Completion means the condition returned a non-empty answer or completed report; it is not an answer-correctness score.
+`evals/v1a_cases.json` contains the existing reference tasks; `evals/v1b_cases.json` adds direct no-tool and adversarial-document cases. `evals/ground_truth.json` and `evals/evaluation_labels.json` are evaluator-only and are never imported into the Agent or tool prompts. The labels separate the development set from a held-out validation set. A held-out case must not be used to tune prompts or thresholds.
 
-Run the independent retrieval evaluation against the real test database:
+The evaluator reports execution completion, completed report status, exact ordered tool selection, argument checks, evidence ID source validity, exact quote fidelity, citation acceptance, latency, tokens, and bad cases separately. Each rate exposes its numerator and denominator. Answer correctness and semantic entailment remain `ungraded` unless a human supplies a label. Task success requires all task-specific automated checks to pass; a case with semantic requirements stays ungraded even if its deterministic checks pass. HTTP 200 and `status=completed` are not task-success labels.
+
+The old Live trace stored only aggregate citation acceptance, not rejected candidate IDs or text, so it cannot support a trustworthy historical breakdown of the five rejected quotes. The new path records missing evidence IDs, unsupported numeric claims, duplicates, and exact-source quote checks. A sanitized regression rejects the fabricated `MISSING` ID; another rejects a `99%` claim when its selected source contains no matching number. Multi-source hypotheses keep separate IDs and separate server-generated quotes. Whether a valid source semantically supports its associated hypothesis remains ungraded.
+
+Run document-level BM25 retrieval against the real test database. The evaluator ranks all chunks, collapses repeated chunks by document ID, then applies Recall@5 and MRR to unique documents. The manually assigned labels are independent of ranking output. The unrelated query has no relevant-document denominator for Recall@5 and contributes zero to MRR when no relevant result is found.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\evaluate_retrieval.py
+.\.venv\Scripts\python.exe scripts\evaluate_retrieval.py --split validation
 ```
 
-Run the bounded live comparison only after confirming current route pricing and quota:
+The process-local BM25 cache recomputes a SHA-256 signature from every ordered document ID, title, and content on each search. It retokenizes and rebuilds the index only when that signature changes, detecting inserts, in-place edits, and deletions without a database migration or distributed cache.
+
+Run the bounded Live comparison only after verifying that the selected model remains zero-priced and the account has free-request quota remaining. The configured inference-key endpoint reports monetary use but may not expose the free request count; inspect the OpenRouter Activity page when the remaining count is unavailable by API. Failed requests also consume the free request allowance.
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\evaluate_agent.py `
-  --case normal-01 `
-  --case missing-evidence-01 `
-  --case direct-no-tool-01 `
-  --case prompt-injection-01 `
+  --split validation `
+  --condition full_agent `
   --confirm-zero-cost-free-endpoint
 ```
 
-For any case involving the adversarial document, the runner inserts a uniquely named temporary document into `caseflow_test` and removes exactly that row in `finally`. Evaluation outputs are written under ignored `.tmp/`. The four-case live sample is an engineering check, not a statistically representative model benchmark. In the measured run, Direct LLM and BM25-RAG each completed 4/4 cases; the full Agent completed 4/4 and selected the expected tool sequence in 4/4. The heuristic numeric scan found zero unmatched numeric tokens. Exact argument matching was scored on one full investigation and passed 1/1. The full Agent citation candidate validity was 46.7%, so it is not yet a strong citation-quality result. The retrieval score applies only to the six manually labeled synthetic queries.
+For any case involving the adversarial document, the runner inserts one uniquely named document into `caseflow_test` and removes exactly that row in `finally`. Outputs go under ignored `.tmp/`. The earlier four-case Live comparison is pre-fix only: each condition returned completed reports for 4/4 cases, but that is execution completion, not task success. Full Agent tool selection was exact in 4/4; explicit argument checks covered only one case and passed 1/1. The 46.7% citation figure was a macro-average over three citation-bearing cases; micro acceptance was 4/8 (50%). Its old heuristic numeric screen found zero unmatched numeric tokens, but it included the user's question among numeric sources and could therefore treat echoed request values as evidence. The current evaluator checks returned evidence only, with a regression that rejects a requested `99%` when the only returned fact is `5%`. These pre-fix free-form quote results are not directly comparable to post-fix evidence-ID resolution and server-generated quote fidelity. No post-fix Live validation was run because the remaining daily free-request quota could not be confirmed through the configured inference key.
 
 ## Known limits and V1-C boundary
 
 - PostgreSQL and live LLM acceptance depend on local Docker/PostgreSQL and user-provided model credentials.
-- BM25 remains the retrieval baseline. Its tokenized document corpus and rank index are cached in process and refreshed when document count or latest update time changes; there is no persistent or vector index.
+- BM25 remains the retrieval baseline. It returns documents for the unrelated validation query and needs a calibrated abstention rule. Current scores come from only nine hand-labelled synthetic queries, so they do not establish broad retrieval performance. The in-process cache now detects changes using a content signature; there is no persistent or vector index.
 - The offline fake is a deterministic test driver with limited question parsing, not an LLM substitute.
 - Synthetic payments do not include card/channel response codes, latency percentiles, customer details, or production-quality alert streams.
-- Citation IDs and exact quote spans are verified, but quote matching does not prove semantic entailment. The live comparison still found rejected citations; improve quote selection and citation supervision before presenting citation quality as reliable.
+- Stable evidence IDs and server-generated source excerpts prevent invented quote text and are checked against the exact catalog supplied to synthesis. They do not prove semantic entailment; the latter remains ungraded pending human review. Historical rejected quote causes cannot be reconstructed because the old traces did not store rejected candidates.
 - The elapsed-time budget is checked between nodes; an in-flight LLM request can finish near its configured request timeout before the next check stops the graph. The implementation does not claim hard cancellation of synchronous provider calls.
 - No recovery action or payment write path exists. pgvector, embedding retrieval, MCP, Redis, multi-agent coordination, web UI, and persistent checkpoints remain out of scope for this V1-B branch.
 
-A V1-C iteration should first improve citation validity and add a larger held-out evaluation set. Only then compare an embedding or hybrid retriever against the same BM25 relevance labels. Keep any write or remediation path outside this read-only investigation Agent.
+A V1-C iteration should add human-reviewed answer and entailment labels, improve BM25 behavior on irrelevant queries, and expand the held-out validation corpus without repeatedly tuning against it. Only then compare an embedding or hybrid retriever against the same relevance labels. Keep any write or remediation path outside this read-only investigation Agent.

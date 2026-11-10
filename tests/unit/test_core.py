@@ -27,14 +27,14 @@ from caseflow.db import make_engine
 from caseflow.models import PaymentAttempt
 from caseflow.schemas import (
     ChangeEventsInput,
-    EvidenceQuote,
-    Hypothesis,
     PaymentMetricsInput,
     SynthesisDraft,
+    SynthesisHypothesis,
 )
 from caseflow.tools.common import ToolFailure
 from caseflow.tools.knowledge import TextChunk, rank_chunks
 from caseflow.tools.metrics import _windows_for_baseline, build_target_filter
+from scripts.evaluate_agent import source_text_from_report, ungrounded_numbers
 
 
 def test_synthetic_dataset_is_deterministic_and_matches_ground_truth():
@@ -173,6 +173,8 @@ def test_langgraph_dynamic_loop_stops_at_budget():
         },
     }
     assert fake.decide([], question, [metric]).tool_calls[0]["name"] == "query_change_events"
+    metric_only = "深圳 2025-01-18 14:00 到 16:00 的支付失败率和按状态分组结果是什么？"
+    assert not fake.decide([], metric_only, [metric]).tool_calls
 
     calls = {"count": 0}
 
@@ -252,6 +254,14 @@ def test_langgraph_dynamic_loop_stops_at_budget():
 
 
 def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
+    numeric_sources = source_text_from_report(
+        {
+            "question": "Please verify whether the rate is 99%.",
+            "statistical_facts": [{"metrics": {"failure_rate": 0.05}}],
+        }
+    )
+    assert ungrounded_numbers("The rate is 5% or 99%.", numeric_sources) == ["99"]
+
     class OneCallModel:
         def __init__(self, draft=None):
             self.turn = 0
@@ -303,9 +313,9 @@ def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
 
     draft = SynthesisDraft(
         hypotheses=[
-            Hypothesis(
+            SynthesisHypothesis(
                 statement="根因已经确认。",
-                citations=[EvidenceQuote(evidence_id="MISSING", quote="没有来源的引用")],
+                evidence_ids=["MISSING"],
             )
         ]
     )
@@ -315,9 +325,86 @@ def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
     cited = InvestigationAgent(
         {"search_knowledge": good}, OneCallModel(draft), "offline_test"
     ).investigate("查询文档")
-    assert not cited.hypotheses and any("引用 ID" in item for item in cited.uncertainties)
+    assert not cited.hypotheses and any("证据 ID" in item for item in cited.uncertainties)
     assert cited.citation_validation.citations_rejected == 1
+    assert cited.citation_validation.unknown_evidence_ids_rejected == 1
     assert cited.citation_validation.hypotheses_kept == 0
+
+    source_selected = InvestigationAgent(
+        {"search_knowledge": good},
+        OneCallModel(
+            SynthesisDraft(
+                hypotheses=[
+                    SynthesisHypothesis(
+                        statement="网关超时可以作为待调查线索。",
+                        evidence_ids=["KNOW-DOC-A-chunk-000", "KNOW-DOC-A-chunk-000"],
+                    )
+                ]
+            )
+        ),
+        "offline_test",
+    ).investigate("查询文档")
+    assert source_selected.citation_validation.citations_received == 2
+    assert source_selected.citation_validation.citations_kept == 1
+    assert source_selected.citation_validation.duplicate_citations_removed == 1
+    assert source_selected.citation_validation.quote_fidelity_failures == 0
+    assert source_selected.hypotheses[0].citations[0].quote == doc["text"]
+
+    unsupported_number = InvestigationAgent(
+        {"search_knowledge": good},
+        OneCallModel(
+            SynthesisDraft(
+                hypotheses=[
+                    SynthesisHypothesis(
+                        statement="失败率为 99%。",
+                        evidence_ids=["KNOW-DOC-A-chunk-000"],
+                    )
+                ]
+            )
+        ),
+        "offline_test",
+    ).investigate("查询文档")
+    assert not unsupported_number.hypotheses
+    assert unsupported_number.citation_validation.numeric_claims_rejected == 1
+
+    uncatalogued_ids = ["KNOW-DOC-A-chunk-000"]
+    uncatalogued_ids.extend(f"KNOW-DOC-{index}-chunk-000" for index in range(1, 6))
+
+    def six_search(query: str):
+        return {
+            "search_id": "SIX",
+            "results": [
+                {
+                    **doc,
+                    "evidence_id": evidence_id,
+                    "document_id": evidence_id.split("-")[1],
+                    "text": f"Document text {index} is a source excerpt.",
+                }
+                for index, evidence_id in enumerate(uncatalogued_ids)
+            ],
+        }
+
+    sixth = uncatalogued_ids[-1]
+    six_tool = StructuredTool.from_function(
+        func=six_search, name="search_knowledge", description="six source test"
+    )
+    not_presented = InvestigationAgent(
+        {"search_knowledge": six_tool},
+        OneCallModel(
+            SynthesisDraft(
+                hypotheses=[
+                    SynthesisHypothesis(
+                        statement="A source outside the presented catalog is rejected.",
+                        evidence_ids=[sixth],
+                    )
+                ]
+            )
+        ),
+        "offline_test",
+    ).investigate("查询第六条文档")
+    assert not not_presented.hypotheses
+    assert not_presented.citation_validation.evidence_ids_not_presented_rejected == 1
+    assert not_presented.citation_validation.unknown_evidence_ids_rejected == 0
 
     class DirectAnswerModel:
         def decide(self, messages, question, tool_results):
