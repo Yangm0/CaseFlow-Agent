@@ -1,0 +1,15 @@
+FROM postgres:17-alpine AS pgvector-build
+
+ARG PGVECTOR_VERSION=v0.8.7
+
+RUN apk add --no-cache --virtual .build-deps build-base git ca-certificates \
+    && git clone --depth 1 --branch "${PGVECTOR_VERSION}" \
+       https://github.com/pgvector/pgvector.git /tmp/pgvector \
+    && make -C /tmp/pgvector with_llvm=no \
+    && make -C /tmp/pgvector with_llvm=no install \
+    && apk del .build-deps
+
+FROM postgres:17-alpine
+
+COPY --from=pgvector-build /usr/local/lib/postgresql/ /usr/local/lib/postgresql/
+COPY --from=pgvector-build /usr/local/share/postgresql/extension/ /usr/local/share/postgresql/extension/

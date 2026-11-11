@@ -1,127 +1,145 @@
-# CaseFlow Agent V1-A
+# CaseFlow Agent
 
-CaseFlow is a small, reviewable payment-incident investigation agent. It connects a FastAPI request to read-only PostgreSQL queries, Chinese BM25 retrieval, and an explicit LangGraph tool loop. It is intended as an interviewable engineering project, not a production payment control plane.
+CaseFlow is a local engineering demonstration for payment incident investigations. It combines a LangGraph investigation loop, PostgreSQL read-only tools, Chinese BM25 retrieval, optional pgvector hybrid search, MCP tool transport, durable threads, and a human-approved support-ticket action. It is not a production payment control plane.
 
-## Current local verification status
+## V1-C acceptance status
 
-Verified on Windows with Python 3.13.2 on 2026-11-10:
+**Locally exercised on 2026-11-11** against the existing synthetic PostgreSQL databases. This is a loopback-bound engineering demo, not a production deployment.
 
-- Installed `.[dev]` into the existing `.venv` through the active v2rayN proxy (`127.0.0.1:10808`). FastAPI, LangGraph, SQLAlchemy, psycopg, jieba, and pytest all import successfully.
-- Docker Desktop 4.99.0 is running with Docker Engine 29.9.3, Compose 5.7.0, and its WSL 2 backend. PostgreSQL 17.11 is healthy on `127.0.0.1:5432`.
-- The separate `caseflow` and `caseflow_test` databases each contain 49,600 payment attempts, 18 documents, 7 changes, 4 incidents, and 12 metadata rows. Re-seeding `caseflow` leaves those counts unchanged. The application role can select but cannot insert, update, or delete; the seed role can create objects in the project schema.
-- Pytest collected 8 tests and all 8 passed, including the PostgreSQL integration checks and offline FastAPI end-to-end investigation. No tests were skipped.
-- A real offline API request returned HTTP 200 and `completed`. It called `query_payment_metrics`, `query_change_events`, and `search_knowledge` in that order. PostgreSQL returned 22/50 failed attempts (44%) versus 10/330 (3.03%) across the seven prior matching windows. The report included related change and incident records, five BM25 passages, and a low-confidence route/retry hypothesis with source-checked quotations; it states that the evidence does not prove causation.
-- This is offline engineering acceptance using the deterministic fake model. No paid or live LLM request was made, and it is not a live model quality evaluation.
+Detailed evidence, including database preservation, tool traces, Live usage, and remaining limits, is in [V1-C final acceptance](docs/V1C_ACCEPTANCE_2026-11-11.md).
 
-## V1-A scope
+| Area | Verified result |
+|---|---|
+| Python and Compose | Existing `.venv`; dependency/import smoke, `pip check`, Ruff, and Compose config passed. |
+| PostgreSQL and data | PostgreSQL 17.11 and pgvector 0.8.7 healthy. Both databases retained 49,600 attempts, 18 documents, 7 changes, and 4 incidents. Pre-migration custom-format backups were readable. |
+| MCP and Agent | Standalone MCP discovered all three tools, validated schemas/errors/disconnects, and returned structured results. Thread investigations used the MCP client against the real test database. |
+| Threads and approvals | Multi-turn thread state survived API/checkpointer restarts and remained isolated by thread. Reject, approve, duplicate and parallel decisions, hash tampering, orphan recovery, audit writes, and direct-write denial were exercised on `caseflow_test`; acceptance work orders were cleaned up. |
+| Retrieval | BM25 fallback and BM25 + pgvector + RRF ran against 18 indexed deterministic 64D test vectors. `EXPLAIN` showed the matching HNSW expression index. Add/update/delete index synchronization passed. These hash vectors test plumbing only; semantic embedding quality was not evaluated. |
+| Browser and SSE | UI investigation, report/evidence, approval decisions, refresh/reload, and SSE event replay after reconnect were exercised in a browser. |
+| Regression | Exactly 8 pytest cases collected and passed. `scripts/mcp_smoke.py` and `scripts/v1c_smoke.py` passed. |
+| Live model | One real investigation completed through the configured zero-price OpenRouter `nvidia/nemotron-3.5-super-vl:free` route: 3 model requests, 8,408 reported tokens, 23.3 s, $0. No fallback was configured. Citation ID/quote checks passed; semantic support for two hypotheses remains ungraded. |
 
-- PostgreSQL tables for synthetic payment attempts, service changes, incidents, documents, and dataset metadata.
-- Parameterized SQLAlchemy aggregate tools with bounded time windows, allow-listed grouping dimensions, statement timeouts, result caps, and database read-only permissions.
-- Chinese tokenization with `jieba` and a real `rank_bm25` index built from documents read from PostgreSQL.
-- A single LangGraph `StateGraph` that loops through model decisions, tool execution, and structured synthesis under hard model/tool call caps, elapsed-time checks between nodes, and per-query PostgreSQL timeouts.
-- `offline_test` uses a deterministic rule-based fake model for tests and demos. It is not a real LLM and is labeled as such.
-- `live` uses an OpenAI-compatible Function Calling API through `langchain-openai`; credentials and endpoint settings come from environment variables.
-- FastAPI endpoints: `GET /health` and `POST /api/v1/investigations`.
+No automatic LLM-created ticket proposal, authentication/authorization layer, production deployment controls, or real embedding provider evaluation is included. The UI prefills a reviewable draft and a human submits it.
 
-V1-A deliberately excludes writes, auto-remediation, pgvector, MCP, Redis, multi-agent coordination, web UI, and persistent checkpoints.
+## Architecture
 
-## Architecture and request path
-
-```text
-POST /api/v1/investigations
-  -> LangGraph decision node
-  -> one or more of the three read-only tools
-  -> tool results returned to the decision node
-  -> structured synthesis
-  -> server-built statistical facts + validated citations
+```mermaid
+flowchart LR
+  Browser[Native HTML UI] -->|JSON + SSE| API[FastAPI]
+  API -->|thread state / resume| Graph[LangGraph]
+  Graph -->|discover + call| Client[LangChain MCP Client]
+  Client -->|Streamable HTTP| MCP[CaseFlow MCP Server]
+  MCP -->|read-only tools| PG[(PostgreSQL 17 + pgvector)]
+  API -->|PostgresSaver| CP[(Checkpoint schema / role)]
+  API -->|approved function calls only| Actions[(Ticket + Approval + Audit functions)]
+  Graph -->|BM25| Docs[Chinese operations documents]
+  Graph -->|optional query embedding + vector search| Vectors[(pgvector index)]
+  Embed[Configured Embedding provider] -. explicit index command .-> Vectors
 ```
 
-The API report keeps statistical facts, retrieved document passages, service changes/incidents, tentative hypotheses, uncertainties, recommendations, tool traces, and operation status in separate fields. Statistical values are copied from tool output by the server. A hypothesis is retained only when its evidence ID exists and its quoted text exactly matches retrieved source content. This checks source linkage and quote fidelity; human review is still needed to judge whether a hypothesis over-interprets a quote.
+The investigation loop is `decision → MCP tool execution → decision → evidence validation and synthesis`. MCP exposes only `query_payment_metrics`, `query_change_events`, and `search_knowledge`; it provides no arbitrary SQL or write tool. The Agent validates discovered names and input schemas against this allowlist. The MCP adapter opens a fresh Streamable HTTP session for each remote tool call; read-only transport errors get one retry and a configured timeout.
 
-## Data definition
+LangGraph checkpoints each thread with a `thread_id`. `history` stores the user's turns and concise assistant report summaries; each investigation also checkpoints its report and tool/model traces. `POST /api/v1/threads/{thread_id}/resume` resumes the saved graph from its latest checkpoint after an interrupted request. Checkpoint tables are stored in the `caseflow_checkpoint` schema through `CHECKPOINT_DATABASE_URL`, separate from the read-only business role. A separate checkpoint namespace stores thread registration, and another stores approval workflow state.
 
-The generator is in `src/caseflow/data/synthetic.py`; it has no dependency on API calls or external data.
+The approval graph stores a pending draft, calls LangGraph `interrupt()`, then waits for an API decision to resume with `Command(resume=...)`. The executor role has `EXECUTE` access to a few `SECURITY DEFINER` database functions only; it has no direct table DML. Those functions bind the approved payload to a database-computed SHA-256 hash, lock the approval row, deduplicate the same active or executed draft within a thread, create at most one ticket per approval, and record audit events in the same transaction. The existing `caseflow_app` remains read-only. Unapproved or changed drafts cannot reach ticket creation. The project has no authentication, so keep it bound to loopback for local demonstration.
 
-- Fixed seed: `20250121`.
-- Local business timezone: `Asia/Shanghai`; generated aware timestamps are stored as PostgreSQL `timestamptz`.
-- Data interval: `[2025-01-01 00:00:00+08:00, 2025-02-01 00:00:00+08:00)`; `as_of` is the exclusive end.
-- Payment attempts: 31 days × 4 regions × 400 records = 49,600 deterministic rows. `pending` rows are present to exercise the denominator rule.
-- Documents: 18 Chinese operations manuals/runbook passages. Changes and incident rows include related and unrelated examples from multiple regions.
-- A Beijing anomaly is injected for `[2025-01-21 09:00, 12:00)`: the terminal failure probability is raised from 2.5% to 40%. The ground-truth label and expected related IDs are isolated in `evals/ground_truth.json`; that file is never imported into the agent, tool prompt, or database.
-- Valid attempts are rows with status `succeeded` or `failed`. Failure rate is `failed_attempts / valid_attempts`; a zero denominator yields `null`.
-- Target intervals are left-closed/right-open. For windows up to 24 hours, the baseline is the seven prior same-clock daily windows. For longer windows, the baseline is the immediately preceding equal-duration interval.
+The checkpointer uses a small psycopg connection pool. Its thread registry retries one transient PostgreSQL connection error, allowing a running API process to recover its durable thread state after a PostgreSQL restart.
 
-Seed/import is additive and idempotent. It creates missing CaseFlow tables and inserts deterministic IDs with `ON CONFLICT DO NOTHING`; it contains no delete, truncate, drop, reset, or volume-removal operation. It accepts database names `caseflow` and `*_test` only. The test workflow uses a separately provisioned `caseflow_test` database.
+BM25 always remains available. If a separate embedding provider is fully configured and the vector table has fresh vectors, retrieval combines BM25 and pgvector rankings with Reciprocal Rank Fusion (RRF), deduplicates stable evidence IDs, and labels the result `hybrid`; otherwise the result is labeled `bm25_only`. The acceptance smoke used a deterministic local hash-vector fixture to test database/index plumbing only; it is not a semantic embedding and is not used as evidence of retrieval quality. A content hash and model name key the stored embedding cache. The reranker is only a provider protocol.
 
-## Setup on Windows PowerShell
+SSE exposes `status`, `agent_step`, `tool_start`, `tool_result`, `evidence`, `approval_required`, `completed`, and `error`. The bounded event journal is process-local; thread history and latest report are durable and can be fetched again after reconnect or process restart, but old intermediate SSE events are not persisted.
 
-Requirements: Python 3.13, Docker Compose v2 for PostgreSQL, and PowerShell. The project does not change the global Python installation.
+## Components and interfaces
+
+| Component | Entry point |
+|---|---|
+| FastAPI + UI | `GET /`, `GET /health`, `POST /api/v1/investigations` |
+| Threads | `POST /api/v1/threads`, `GET /api/v1/threads/{thread_id}`, `POST /api/v1/threads/{thread_id}/messages`, `POST /api/v1/threads/{thread_id}/resume`, `GET /api/v1/threads/{thread_id}/events` |
+| Ticket approvals | `POST/GET /api/v1/threads/{thread_id}/approvals`, `GET /api/v1/threads/{thread_id}/approvals/{approval_id}`, `POST /api/v1/threads/{thread_id}/approvals/{approval_id}/decision` with `{"decision":"approve"}` or `{"decision":"reject"}` |
+| Standalone MCP | `caseflow-mcp`, Streamable HTTP at `/mcp`, health at `/health` |
+| MCP smoke | `python scripts/mcp_smoke.py` (starts a local MCP subprocess; test DB only) |
+| Checkpoint setup | `python scripts/setup_checkpoint_db.py`; use `--test` with `TEST_CHECKPOINT_DATABASE_URL` |
+| Database migration | `.\scripts\apply_v1c_migration.ps1` (explicit; run only after reviewing/backup) |
+| Embedding index | `python scripts/index_embeddings.py --confirm-embedding-api` |
+| Retrieval evaluation | `python scripts/evaluate_retrieval.py --retriever bm25|vector|hybrid`; Vector/Hybrid also require `--confirm-embedding-api` |
+
+The original `/api/v1/investigations` endpoint remains available for single-shot native tool use. Durable thread investigations use the MCP client. LangGraph's thread history is isolated by `thread_id`; FastAPI serializes concurrent messages on the same thread within one process.
+
+## Windows setup
+
+Use Python 3.13.2, Docker Desktop with WSL 2, PowerShell, and the existing project `.venv`. Do not overwrite an existing `.env`:
 
 ```powershell
-Copy-Item .env.example .env
-python --version
-python -m venv .venv
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 New-Item -ItemType Directory -Path .tmp -Force | Out-Null
 $env:TEMP = (Resolve-Path .tmp).Path
 $env:TMP = $env:TEMP
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
-The sample `.env` values are for local development only. Change passwords before exposing PostgreSQL beyond loopback. Compose provisions a `caseflow` development database and an isolated `caseflow_test` database, with separate `caseflow_app` (read-only) and `caseflow_seed` (schema/seed) roles.
+The Compose PostgreSQL service builds `Dockerfile.postgres`: pgvector 0.8.7 is compiled into the same `postgres:17-alpine` base used by the existing instance. This preserves PostgreSQL's Alpine/libc data-directory compatibility while retaining the existing `caseflow_pgdata` named volume. The V1-C acceptance backed up both databases before applying migrations, and verified the custom-format dumps were readable. Compose does not contain a volume deletion or reset command. **Do not use `docker compose down -v`.** The V1-C migration and checkpoint `setup()` are separate, explicit steps; neither runs at API startup.
+
+For a fresh local setup, review `.env.example`, change the development-only passwords, and then start services:
 
 ```powershell
 docker compose up -d postgres
-python scripts/seed_database.py
+.\.venv\Scripts\python.exe scripts\seed_database.py
+.\scripts\apply_v1c_migration.ps1
+.\.venv\Scripts\python.exe scripts\setup_checkpoint_db.py
+docker compose up -d mcp api
 ```
 
-The script prints row counts. Re-running it is safe and does not delete existing records. It does not attempt to install or configure Docker/PostgreSQL.
+To migrate the isolated test database separately, run `.\scripts\apply_v1c_migration.ps1 -Database caseflow_test`, set `TEST_CHECKPOINT_DATABASE_URL`, then run `.\.venv\Scripts\python.exe scripts\setup_checkpoint_db.py --test`. The SQL script needs the Compose administrator role. Existing Docker volumes do not rerun `/docker-entrypoint-initdb.d`; use the explicit migration for an existing volume.
 
-## Offline run
+The API and MCP ports are published on `127.0.0.1` only. For local non-Compose use, start MCP with `.\.venv\Scripts\python.exe -m caseflow_mcp.server` and FastAPI with `.\.venv\Scripts\python.exe -m uvicorn caseflow.api:app --app-dir src`. Set `DATABASE_URL`, `CHECKPOINT_DATABASE_URL`, and `ACTION_EXECUTOR_DATABASE_URL` in the local environment. Persistent threads require the checkpoint URL and previously initialized checkpoint tables. Ticket approvals also require the function-only action executor URL and the explicit SQL migration.
 
-Keep `CASEFLOW_MODE=offline_test` in `.env`:
+## Configuration and secrets
+
+`.env.example` contains development-only connection values. `.env` is ignored by Git. Never put credentials in reports, traces, README, or committed files.
+
+| Setting | Use |
+|---|---|
+| `DATABASE_URL` | Read-only business queries. |
+| `SEED_DATABASE_URL` | Synthetic seed and isolated test fixture writes. |
+| `CHECKPOINT_DATABASE_URL` | LangGraph checkpoint role/schema. |
+| `ACTION_EXECUTOR_DATABASE_URL` | Function-only approval executor role. |
+| `EMBEDDING_INDEX_DATABASE_URL` | Limited writes to the vector table. |
+| `CASEFLOW_MCP_SERVER_URL` | Agent's independent MCP server endpoint. |
+| `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL` | Live chat model. |
+| `EMBEDDING_API_KEY`, `EMBEDDING_BASE_URL`, `EMBEDDING_MODEL`, `EMBEDDING_DIMENSIONS` | Separate OpenAI-compatible Embeddings provider. |
+
+No LLM or Embedding API is invoked by application startup. Embedding document indexing and Vector/Hybrid evaluation explicitly require `--confirm-embedding-api`. BM25-only does not need embedding credentials.
+
+## Synthetic dataset and V1-B baseline
+
+The deterministic generator uses seed `20250121` and contains 49,600 payment attempts, 18 Chinese documents, 7 changes, and 4 incidents. The Beijing window on 2025-01-21 09:00–12:00 has 22/50 failures; the seven-window baseline is 10/330. The V1-B database and offline Agent checks had previously been run against synthetic PostgreSQL data. Those earlier measurements predate the new V1-C integration and must not be treated as a V1-C acceptance result.
+
+## Tests and manual CI
+
+The suite remains limited to eight collected pytest cases. On 2026-11-11, collect-only reported 8, the full suite passed 8/8, and Ruff was clean. `scripts/v1c_smoke.py` exercises real test-PostgreSQL vector indexing/search and the approval/recovery/permission path without increasing pytest collection. `scripts/mcp_smoke.py` launches the standalone MCP server and tests the transport. The GitHub Actions workflow `Manual quality and PostgreSQL integration` has only the `workflow_dispatch` trigger; it was not dispatched as part of this local acceptance.
+
+Re-run the local acceptance checks with:
 
 ```powershell
-python -m uvicorn caseflow.api:app --app-dir src --reload
+.\.venv\Scripts\python.exe -m pytest --collect-only -q
+ruff check src scripts tests
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe scripts\mcp_smoke.py
+.\.venv\Scripts\python.exe scripts\v1c_smoke.py
 ```
 
-In another PowerShell window:
+The `v1c_smoke.py` script creates uniquely tagged approval acceptance rows in `caseflow_test`; after inspecting its report, remove only that run's tagged approval, ticket, audit, and checkpoint rows. It does not reset databases or volumes. Browser/SSE checks and Live calls are separate. A Live call uses the configured model and consumes the provider's quota; confirm current zero-price routing and available quota first, cap total requests, and do not switch to paid routes. The 2026-11-11 Live investigation used 3 model requests on a route verified at zero prompt/completion price.
 
-```powershell
-Invoke-RestMethod http://127.0.0.1:8000/health
-$body = @{ question = '北京 2025-01-21 09:00 到 12:00 支付失败率是否异常？请查一下变更和文档。' } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/investigations -ContentType 'application/json' -Body $body
-```
+## V1-B validation record (historical)
 
-This exercises real SQL and BM25 against the local PostgreSQL instance, but the offline decision and synthesis are driven by a deterministic fake model. It must not be described as a real LLM result. The offline parser supports the documented demo query style and falls back to the synthetic Beijing scenario when no explicit date/window is present.
+The earlier V1-B baseline reported Python 3.13.2, Docker Desktop/PostgreSQL 17, eight collected tests passing, and a real offline PostgreSQL+BM25 investigation returning Beijing 22/50 (44.00%) against 10/330 (3.03%). It recorded tool order metrics → changes → knowledge search and exact server-generated citation matching. At that earlier V1-B checkpoint, a post-fix Live result was not available because free quota had not been confirmed. The V1-C Live investigation is documented in the acceptance record above; this historical baseline is not evidence for V1-C.
 
-## Live model run
+## Limitations
 
-Set `CASEFLOW_MODE=live`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and optionally `OPENAI_BASE_URL` in `.env`, then restart the API. The model must support tool/function calling and structured output. No credentials are bundled; without a key, `/health` reports degraded status and investigation requests return `blocked` with `LLM_CREDENTIALS_MISSING`. No paid service is opened automatically.
-
-The API response does not include the key or configured base URL. Tool-call traces contain tool names, validated arguments, timings, outcomes, and evidence IDs; they do not log model credentials or raw SQL.
-
-## Tests
-
-```powershell
-python -m pytest -q
-```
-
-The suite intentionally contains only 8 tests: five compact unit checks and three PostgreSQL integration checks, including one end-to-end investigation. Integration and end-to-end tests require both `TEST_DATABASE_URL` and `TEST_SEED_DATABASE_URL` pointing to the isolated `caseflow_test` database and its read-only/seed roles. The fixture refuses database names other than `caseflow_test`. If the URLs are absent, those tests are reported as skipped; skipped tests are not PostgreSQL or end-to-end passes.
-
-Integration coverage includes database connectivity, deterministic import counts/idempotency, SQL interval boundaries, real BM25 retrieval, read-only permission enforcement, API response shape, and an offline fake-model investigation using actual PostgreSQL and BM25 tools. It does not substitute SQLite or a mocked database for PostgreSQL.
-
-## Evaluation cases
-
-`evals/v1a_cases.json` contains 20 categorized reference tasks covering normal/no-anomaly investigations, missing evidence, invalid parameters, security, tool failures/timeouts, citation validation, and uncertainty. `evals/ground_truth.json` is for evaluator use only and is not part of the agent's runtime context. V1-A includes the cases and their references; it does not claim model accuracy or measured quality improvements.
-
-## Known limits and V1-B boundary
-
-- PostgreSQL and live LLM acceptance depend on local Docker/PostgreSQL and user-provided model credentials.
-- The BM25 index is built from the current PostgreSQL document rows per search request; there is no persistent/vector index.
-- The offline fake is a deterministic test driver with limited question parsing, not an LLM substitute.
-- Synthetic payments do not include card/channel response codes, latency percentiles, customer details, or production-quality alert streams.
-- Citation IDs and exact quote spans are verified, but semantic entailment between a quote and a generated hypothesis is not fully automatic.
-- The elapsed-time budget is checked between nodes; an in-flight LLM request can finish near its configured request timeout before the next check stops the graph. Hard call caps and PostgreSQL statement timeouts remain enforced.
-- No recovery action or payment write path exists.
-
-V1-B can add a reproducible held-out evaluation runner and richer response-code/latency evidence after V1-A's PostgreSQL-backed path is verified. pgvector, MCP, Redis, and multi-agent orchestration should remain separate decisions rather than prerequisites for that boundary.
+- A real Embedding provider was not configured. The deterministic test vectors validate pgvector storage, index selection, and retrieval code paths, not semantic relevance or an embedding benchmark.
+- The tool approval form is populated from an evidence-backed report but is submitted by a human; an LLM-generated ticket draft or automatic “should we open a ticket?” decision is not implemented.
+- The event journal is in process memory; durable conversation history and latest reports are available through the thread endpoint after reconnect.
+- The project has no authentication, multi-user isolation, public ingress protection, ticket lifecycle beyond creation, or production operations policy.
+- The reranker interface is an extension seam only. No provider or synthetic scoring behavior is presented as a real reranker.
+- Hybrid search depends on a compatible embedding endpoint, a successful explicit document-index run, matching model/dimensions, and the pgvector migration. BM25 remains the fallback.
+- Synthetic payment attempts do not represent production transaction data. Time overlap between an incident/change and a metric anomaly is a lead, not causal proof.

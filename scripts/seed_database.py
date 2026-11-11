@@ -6,7 +6,9 @@ from caseflow.db import make_engine
 def main() -> None:
     settings = get_settings()
     if not settings.seed_database_url:
-        raise SystemExit("SEED_DATABASE_URL is required; the application DATABASE_URL is read-only.")
+        raise SystemExit(
+            "SEED_DATABASE_URL is required; the application DATABASE_URL is read-only."
+        )
     seed_engine = make_engine(settings.seed_database_url)
     try:
         counts = seed_database(seed_engine)

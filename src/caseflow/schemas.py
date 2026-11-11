@@ -2,9 +2,28 @@ from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 RegionName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
+EvidenceID = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=128)]
+REGION_ALIASES = {
+    "beijing": "北京",
+    "shanghai": "上海",
+    "shenzhen": "深圳",
+    "hangzhou": "杭州",
+}
+
+
+def canonical_region(value: str) -> str:
+    normalized = value.strip()
+    return REGION_ALIASES.get(normalized.casefold(), normalized)
 
 
 class GroupDimension(StrEnum):
@@ -39,6 +58,11 @@ class PaymentMetricsInput(TimeWindowInput):
     region: RegionName
     group_by: list[GroupDimension] = Field(default_factory=list, max_length=2)
 
+    @field_validator("region")
+    @classmethod
+    def normalize_region(cls, value: str) -> str:
+        return canonical_region(value)
+
     @field_validator("group_by")
     @classmethod
     def unique_grouping(cls, values: list[GroupDimension]) -> list[GroupDimension]:
@@ -57,11 +81,18 @@ class KnowledgeSearchInput(BaseModel):
 class ChangeEventsInput(TimeWindowInput):
     region: RegionName | None = None
 
+    @field_validator("region")
+    @classmethod
+    def normalize_region(cls, value: str | None) -> str | None:
+        return canonical_region(value) if value else value
+
 
 class InvestigationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    question: Annotated[str, StringConstraints(strip_whitespace=True, min_length=3, max_length=2000)]
+    question: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=3, max_length=2000)
+    ]
 
 
 class EvidenceQuote(BaseModel):
@@ -75,8 +106,14 @@ class Hypothesis(BaseModel):
     citations: list[EvidenceQuote] = Field(default_factory=list, max_length=5)
 
 
+class SynthesisHypothesis(BaseModel):
+    statement: str = Field(min_length=4, max_length=700)
+    confidence: Literal["low", "medium", "high"] = "low"
+    evidence_ids: list[EvidenceID] = Field(default_factory=list, max_length=5)
+
+
 class SynthesisDraft(BaseModel):
-    hypotheses: list[Hypothesis] = Field(default_factory=list, max_length=5)
+    hypotheses: list[SynthesisHypothesis] = Field(default_factory=list, max_length=5)
     uncertainties: list[str] = Field(default_factory=list, max_length=8)
     recommendations: list[str] = Field(default_factory=list, max_length=8)
 
@@ -88,6 +125,46 @@ class ToolTrace(BaseModel):
     elapsed_ms: int = Field(ge=0)
     evidence_ids: list[str] = Field(default_factory=list)
     error_code: str | None = None
+
+
+class ModelCallTrace(BaseModel):
+    stage: Literal["decision", "synthesis"]
+    model: str
+    method: str
+    status: Literal["succeeded", "failed"]
+    elapsed_ms: int = Field(ge=0)
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    error_code: str | None = None
+    error_type: str | None = None
+    provider_status_code: int | None = Field(default=None, ge=100, le=599)
+
+
+class TokenUsageSummary(BaseModel):
+    available: bool = False
+    input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+    unavailable_calls: int = Field(default=0, ge=0)
+
+
+class CitationValidationSummary(BaseModel):
+    hypotheses_received: int = Field(default=0, ge=0)
+    hypotheses_kept: int = Field(default=0, ge=0)
+    hypotheses_without_evidence: int = Field(default=0, ge=0)
+    citations_received: int = Field(default=0, ge=0)
+    citations_kept: int = Field(default=0, ge=0)
+    citations_rejected: int = Field(default=0, ge=0)
+    evidence_ids_resolved: int = Field(default=0, ge=0)
+    evidence_ids_unresolved: int = Field(default=0, ge=0)
+    evidence_ids_not_presented_rejected: int = Field(default=0, ge=0)
+    duplicate_citations_removed: int = Field(default=0, ge=0)
+    unknown_evidence_ids_rejected: int = Field(default=0, ge=0)
+    numeric_claims_rejected: int = Field(default=0, ge=0)
+    quote_fidelity_checks: int = Field(default=0, ge=0)
+    quote_fidelity_failures: int = Field(default=0, ge=0)
+    semantic_support_ungraded: int = Field(default=0, ge=0)
 
 
 class MetricEvidence(BaseModel):
@@ -106,6 +183,8 @@ class DocumentEvidence(BaseModel):
     title: str
     text: str
     score: float
+    retrieval_mode: Literal["bm25_only", "hybrid"] = "bm25_only"
+    retrieval_sources: list[Literal["bm25", "pgvector"]] = Field(default_factory=list)
 
 
 class ChangeEvidence(BaseModel):
@@ -125,6 +204,7 @@ class InvestigationReport(BaseModel):
     mode: Literal["offline_test", "live"]
     status: Literal["completed", "partial", "failed", "blocked"]
     summary: str
+    direct_answer: str | None = None
     statistical_facts: list[MetricEvidence]
     document_evidence: list[DocumentEvidence]
     system_events: list[ChangeEvidence]
@@ -133,4 +213,10 @@ class InvestigationReport(BaseModel):
     recommendations: list[str]
     tool_calls: list[ToolTrace]
     operations_executed: list[str]
+    model_calls: list[ModelCallTrace] = Field(default_factory=list)
+    token_usage: TokenUsageSummary = Field(default_factory=TokenUsageSummary)
+    citation_validation: CitationValidationSummary = Field(
+        default_factory=CitationValidationSummary
+    )
+    elapsed_ms: int = Field(default=0, ge=0)
     error: dict[str, str] | None = None

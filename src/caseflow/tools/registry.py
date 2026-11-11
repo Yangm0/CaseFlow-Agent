@@ -3,6 +3,9 @@ from datetime import datetime
 from langchain_core.tools import StructuredTool
 from sqlalchemy.engine import Engine
 
+from caseflow.config import Settings
+from caseflow.retrieval.embeddings import OpenAIEmbeddingProvider
+from caseflow.retrieval.vector import VectorSearchService
 from caseflow.schemas import (
     ChangeEventsInput,
     GroupDimension,
@@ -13,14 +16,26 @@ from caseflow.tools.changes import ChangeEventsService
 from caseflow.tools.knowledge import KnowledgeService
 from caseflow.tools.metrics import MetricsService
 
-ALLOWED_TOOL_NAMES = frozenset(
-    {"query_payment_metrics", "search_knowledge", "query_change_events"}
-)
+ALLOWED_TOOL_NAMES = frozenset({"query_payment_metrics", "search_knowledge", "query_change_events"})
 
 
-def build_tool_registry(engine: Engine, statement_timeout_ms: int) -> dict[str, StructuredTool]:
+def build_tool_registry(
+    engine: Engine,
+    statement_timeout_ms: int,
+    settings: Settings | None = None,
+) -> dict[str, StructuredTool]:
     metrics = MetricsService(engine, statement_timeout_ms)
-    knowledge = KnowledgeService(engine, statement_timeout_ms)
+    vector_search = None
+    if (
+        settings
+        and settings.embedding_api_key
+        and settings.embedding_model
+        and settings.embedding_dimensions
+    ):
+        if settings.embedding_api_key.get_secret_value().strip():
+            provider = OpenAIEmbeddingProvider(settings)
+            vector_search = VectorSearchService(engine, provider, statement_timeout_ms)
+    knowledge = KnowledgeService(engine, statement_timeout_ms, vector_search=vector_search)
     changes = ChangeEventsService(engine, statement_timeout_ms)
 
     def query_payment_metrics(
@@ -45,17 +60,16 @@ def build_tool_registry(engine: Engine, statement_timeout_ms: int) -> dict[str, 
         end_at: datetime,
         region: str | None = None,
     ):
-        return changes.query(
-            ChangeEventsInput(region=region, start_at=start_at, end_at=end_at)
-        )
+        return changes.query(ChangeEventsInput(region=region, start_at=start_at, end_at=end_at))
 
     return {
         "query_payment_metrics": StructuredTool.from_function(
             func=query_payment_metrics,
             name="query_payment_metrics",
             description=(
-                "Read payment-attempt counts, failures, failure rate, seven matching prior-day windows "
-                "(or an equal-duration preceding baseline), and optional allow-listed groupings from PostgreSQL. "
+                "Read payment-attempt counts, failures, and failure rate. Include seven matching "
+                "prior-day windows (or an equal-duration preceding baseline) and optional "
+                "allow-listed groupings from PostgreSQL. "
                 "Pass timezone-aware timestamps. The interval is [start_at, end_at)."
             ),
             args_schema=PaymentMetricsInput,
@@ -64,7 +78,7 @@ def build_tool_registry(engine: Engine, statement_timeout_ms: int) -> dict[str, 
             func=search_knowledge,
             name="search_knowledge",
             description=(
-                "Search the generated payment operations manuals and runbooks with Chinese-tokenized BM25. "
+                "Search generated payment manuals and runbooks with Chinese-tokenized BM25. "
                 "Returns source text and stable document/chunk citations."
             ),
             args_schema=KnowledgeSearchInput,
@@ -73,7 +87,10 @@ def build_tool_registry(engine: Engine, statement_timeout_ms: int) -> dict[str, 
             func=query_change_events,
             name="query_change_events",
             description=(
-                "Read service changes and incident records in a timezone-aware [start_at, end_at) interval. "
+                "Read service changes and incident records in a timezone-aware "
+                "[start_at, end_at) interval. In a multi-tool anomaly investigation, include "
+                "the two hours before the metric window unless the user requests exact-window "
+                "events only. "
                 "A time overlap is a lead, not proof of causation."
             ),
             args_schema=ChangeEventsInput,

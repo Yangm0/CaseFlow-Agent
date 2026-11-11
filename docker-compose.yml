@@ -1,22 +1,71 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: caseflow-postgres:17-alpine-pgvector
+    build:
+      context: .
+      dockerfile: Dockerfile.postgres
     environment:
       POSTGRES_DB: caseflow
       POSTGRES_USER: ${POSTGRES_USER:-caseflow_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-caseflow_admin_dev}
       CASEFLOW_APP_PASSWORD: ${CASEFLOW_APP_PASSWORD:-caseflow_app_dev}
       CASEFLOW_SEED_PASSWORD: ${CASEFLOW_SEED_PASSWORD:-caseflow_seed_dev}
+      CASEFLOW_CHECKPOINT_PASSWORD: ${CASEFLOW_CHECKPOINT_PASSWORD:-caseflow_checkpoint_dev}
+      CASEFLOW_ACTION_PASSWORD: ${CASEFLOW_ACTION_PASSWORD:-caseflow_action_dev}
+      CASEFLOW_EMBEDDING_INDEX_PASSWORD: ${CASEFLOW_EMBEDDING_INDEX_PASSWORD:-caseflow_embedding_index_dev}
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
       - caseflow_pgdata:/var/lib/postgresql/data
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./migrations:/migrations:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d caseflow"]
       interval: 5s
       timeout: 3s
       retries: 20
+
+  mcp:
+    build: .
+    env_file: .env
+    command: ["caseflow-mcp"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${CASEFLOW_APP_USER:-caseflow_app}:${CASEFLOW_APP_PASSWORD:-caseflow_app_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
+      CASEFLOW_MCP_HOST: 0.0.0.0
+      CASEFLOW_MCP_PORT: 8001
+    ports:
+      - "127.0.0.1:${CASEFLOW_MCP_HOST_PORT:-8001}:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    env_file: .env
+    command: ["python", "-m", "uvicorn", "caseflow.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://${CASEFLOW_APP_USER:-caseflow_app}:${CASEFLOW_APP_PASSWORD:-caseflow_app_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
+      CHECKPOINT_DATABASE_URL: postgresql://caseflow_checkpoint:${CASEFLOW_CHECKPOINT_PASSWORD:-caseflow_checkpoint_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
+      ACTION_EXECUTOR_DATABASE_URL: postgresql+psycopg://caseflow_action_executor:${CASEFLOW_ACTION_PASSWORD:-caseflow_action_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
+      EMBEDDING_INDEX_DATABASE_URL: postgresql+psycopg://caseflow_embedding_indexer:${CASEFLOW_EMBEDDING_INDEX_PASSWORD:-caseflow_embedding_index_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
+      CASEFLOW_MCP_SERVER_URL: http://mcp:8001/mcp
+    ports:
+      - "127.0.0.1:${CASEFLOW_API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).read()"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   caseflow_pgdata:
