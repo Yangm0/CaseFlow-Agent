@@ -1,6 +1,6 @@
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -112,10 +112,36 @@ class SynthesisHypothesis(BaseModel):
     evidence_ids: list[EvidenceID] = Field(default_factory=list, max_length=5)
 
 
+class ActionProposal(BaseModel):
+    """Model-authored ticket fields; the server binds them to verified investigation evidence."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=180)]
+    description: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=10, max_length=4000)
+    ]
+    priority: Literal["low", "medium", "high"]
+    region: RegionName
+    supporting_evidence_ids: list[EvidenceID] = Field(min_length=1, max_length=8)
+    rationale: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=8, max_length=1200)
+    ]
+
+
+class TicketDraft(ActionProposal):
+    """Validated action payload persisted for HITL; investigation ID is server-bound."""
+
+    source_investigation_id: Annotated[
+        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
+    ]
+
+
 class SynthesisDraft(BaseModel):
     hypotheses: list[SynthesisHypothesis] = Field(default_factory=list, max_length=5)
     uncertainties: list[str] = Field(default_factory=list, max_length=8)
     recommendations: list[str] = Field(default_factory=list, max_length=8)
+    action_proposal: ActionProposal | None = None
 
 
 class ToolTrace(BaseModel):
@@ -218,5 +244,17 @@ class InvestigationReport(BaseModel):
     citation_validation: CitationValidationSummary = Field(
         default_factory=CitationValidationSummary
     )
+    action_proposal: TicketDraft | None = None
+    action_status: Literal[
+        "investigation_completed",
+        "action_proposed",
+        "awaiting_approval",
+        "approved",
+        "rejected",
+        "executed",
+        "action_failed",
+    ] = "investigation_completed"
+    approval_id: str | None = None
+    action_result: dict[str, Any] | None = None
     elapsed_ms: int = Field(default=0, ge=0)
     error: dict[str, str] | None = None

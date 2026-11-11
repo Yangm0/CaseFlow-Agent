@@ -9,7 +9,7 @@ from typing import Any
 
 from caseflow.config import get_settings
 from caseflow.db import make_engine
-from caseflow.retrieval.embeddings import OpenAIEmbeddingProvider
+from caseflow.retrieval.embeddings import build_embedding_provider
 from caseflow.retrieval.vector import VectorSearchService
 from caseflow.tools.knowledge import KnowledgeService, _reciprocal_rank_fusion
 
@@ -24,7 +24,7 @@ def main() -> int:
     parser.add_argument(
         "--confirm-embedding-api",
         action="store_true",
-        help="Confirm that query text will be sent to the configured Embedding API.",
+        help="Confirm that query text may be sent to the configured external embedding API.",
     )
     args = parser.parse_args()
     settings = get_settings()
@@ -45,23 +45,20 @@ def main() -> int:
         raise SystemExit(f"No retrieval queries found for split={args.split}.")
     service = KnowledgeService(engine, settings.sql_statement_timeout_ms)
     vector_search = None
+    embedding_provider = None
     if args.retriever != "bm25":
-        if not args.confirm_embedding_api:
+        if settings.embedding_provider == "openai_compatible" and not args.confirm_embedding_api:
             engine.dispose()
             raise SystemExit(
-                "Pass --confirm-embedding-api before using vector or hybrid evaluation."
+                "Pass --confirm-embedding-api before sending queries to an external provider."
             )
-        if not (
-            settings.embedding_api_key
-            and settings.embedding_api_key.get_secret_value().strip()
-            and settings.embedding_model
-            and settings.embedding_dimensions
-        ):
+        embedding_provider = build_embedding_provider(settings)
+        if embedding_provider is None:
             engine.dispose()
-            raise SystemExit("Embedding credentials, model, and dimensions are required.")
+            raise SystemExit("Configure an embedding provider, model, and dimensions first.")
         vector_search = VectorSearchService(
             engine,
-            OpenAIEmbeddingProvider(settings),
+            embedding_provider,
             settings.sql_statement_timeout_ms,
         )
     results: list[dict[str, Any]] = []
@@ -132,6 +129,7 @@ def main() -> int:
     report = {
         "mode": f"retrieval_only_postgresql_{args.retriever}",
         "dataset": "caseflow_test synthetic documents",
+        "embedding_model": embedding_provider.model if embedding_provider else None,
         "case_count": len(results),
         f"recall_at_{args.k}_definition": (
             f"unique relevant document IDs in top {args.k} unique document results / all labelled "

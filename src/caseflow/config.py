@@ -46,12 +46,18 @@ class Settings(BaseSettings):
     embedding_api_key: SecretStr | None = Field(
         default=None, validation_alias="EMBEDDING_API_KEY"
     )
+    embedding_provider: Literal["openai_compatible", "fastembed"] = Field(
+        default="openai_compatible", validation_alias="EMBEDDING_PROVIDER"
+    )
     embedding_base_url: str | None = Field(
         default=None, validation_alias="EMBEDDING_BASE_URL"
     )
     embedding_model: str | None = Field(default=None, validation_alias="EMBEDDING_MODEL")
     embedding_dimensions: int | None = Field(
         default=None, gt=0, le=2000, validation_alias="EMBEDDING_DIMENSIONS"
+    )
+    embedding_cache_dir: str = Field(
+        default=".tmp/fastembed_cache", validation_alias="EMBEDDING_CACHE_DIR"
     )
     embedding_index_database_url: str | None = Field(
         default=None, validation_alias="EMBEDDING_INDEX_DATABASE_URL"

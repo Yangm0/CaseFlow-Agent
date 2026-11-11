@@ -1,5 +1,7 @@
 import hashlib
+import sys
 from datetime import timedelta
+from types import SimpleNamespace
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -253,7 +255,7 @@ def test_langgraph_dynamic_loop_stops_at_budget():
     assert duplicate.tool_calls[1].error_code == "DUPLICATE_TOOL_CALL"
 
 
-def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
+def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed(monkeypatch):
     numeric_sources = source_text_from_report(
         {
             "question": "Please verify whether the rate is 99%.",
@@ -483,6 +485,37 @@ def test_tool_failure_bad_citation_and_unconfigured_live_mode_fail_closed():
     limited = live.synthesize_outcome("查询证据", [], max_attempts=1)
     assert limited.error_code == "MODEL_STRUCTURED_OUTPUT_UNSUPPORTED"
     assert methods == ["json_schema"] and len(limited.traces) == 1
+
+    init_arguments = []
+
+    class ChatOpenAIStub:
+        def __init__(self, **kwargs):
+            init_arguments.append(kwargs)
+
+        def bind_tools(self, tools, tool_choice):
+            return self
+
+    monkeypatch.setitem(
+        sys.modules,
+        "langchain_openai",
+        SimpleNamespace(ChatOpenAI=ChatOpenAIStub),
+    )
+    LiveLLM(
+        Settings(
+            mode="live",
+            openai_api_key="test-key-never-used",
+            openai_base_url="https://openrouter.ai/api/v1",
+            openai_model="nvidia/nemotron-3.5-super-vl:free",
+        ),
+        [],
+    )
+    assert len(init_arguments) == 2
+    assert all(
+        item["model"] == "nvidia/nemotron-3.5-super-vl:free"
+        and item["extra_body"] == {"provider": {"allow_fallbacks": False}}
+        and "models" not in item["extra_body"]
+        for item in init_arguments
+    )
 
     from fastapi.testclient import TestClient
 

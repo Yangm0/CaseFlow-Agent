@@ -1,10 +1,11 @@
+import logging
 from datetime import datetime
 
 from langchain_core.tools import StructuredTool
 from sqlalchemy.engine import Engine
 
 from caseflow.config import Settings
-from caseflow.retrieval.embeddings import OpenAIEmbeddingProvider
+from caseflow.retrieval.embeddings import build_embedding_provider
 from caseflow.retrieval.vector import VectorSearchService
 from caseflow.schemas import (
     ChangeEventsInput,
@@ -17,6 +18,12 @@ from caseflow.tools.knowledge import KnowledgeService
 from caseflow.tools.metrics import MetricsService
 
 ALLOWED_TOOL_NAMES = frozenset({"query_payment_metrics", "search_knowledge", "query_change_events"})
+logger = logging.getLogger(__name__)
+
+
+class _UnavailableVectorSearch:
+    def search(self, query, chunks, top_k):
+        raise RuntimeError("Configured vector search is unavailable.")
 
 
 def build_tool_registry(
@@ -26,15 +33,17 @@ def build_tool_registry(
 ) -> dict[str, StructuredTool]:
     metrics = MetricsService(engine, statement_timeout_ms)
     vector_search = None
-    if (
-        settings
-        and settings.embedding_api_key
-        and settings.embedding_model
-        and settings.embedding_dimensions
-    ):
-        if settings.embedding_api_key.get_secret_value().strip():
-            provider = OpenAIEmbeddingProvider(settings)
-            vector_search = VectorSearchService(engine, provider, statement_timeout_ms)
+    if settings:
+        try:
+            provider = build_embedding_provider(settings)
+            if provider is not None:
+                vector_search = VectorSearchService(engine, provider, statement_timeout_ms)
+        except Exception as error:
+            logger.warning(
+                "Embedding provider unavailable (%s); BM25 fallback remains active.",
+                type(error).__name__,
+            )
+            vector_search = _UnavailableVectorSearch()
     knowledge = KnowledgeService(engine, statement_timeout_ms, vector_search=vector_search)
     changes = ChangeEventsService(engine, statement_timeout_ms)
 
