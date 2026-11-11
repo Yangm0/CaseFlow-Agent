@@ -25,7 +25,12 @@ from caseflow.config import Settings, get_settings
 from caseflow.db import check_database, make_engine
 from caseflow.events import ThreadEventHub, format_sse
 from caseflow.mcp_client import build_mcp_tool_registry
-from caseflow.schemas import InvestigationReport, InvestigationRequest
+from caseflow.schemas import (
+    InvestigationReport,
+    InvestigationRequest,
+    TicketDraft,
+    canonical_region,
+)
 from caseflow.tools.registry import build_tool_registry
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -46,6 +51,96 @@ def _message_to_dict(message: Any) -> dict[str, str]:
     if not isinstance(content, str):
         content = str(content)
     return {"role": role, "content": content}
+
+
+def _report_evidence_ids(report: dict[str, Any]) -> tuple[set[str], set[str]]:
+    metric_ids = {
+        str(item.get("evidence_id"))
+        for item in report.get("statistical_facts", [])
+        if item.get("evidence_id")
+    }
+    other_ids = {
+        str(item.get("evidence_id"))
+        for item in [*report.get("document_evidence", []), *report.get("system_events", [])]
+        if item.get("evidence_id")
+    }
+    return metric_ids, other_ids
+
+
+def _validate_ticket_draft(draft: TicketDraft, report: dict[str, Any]) -> None:
+    if not report.get("investigation_id") or report.get("status") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail="A completed evidence-backed investigation is required before approval.",
+        )
+    if draft.source_investigation_id != report["investigation_id"]:
+        raise HTTPException(status_code=422, detail="Draft must reference this investigation.")
+    metric_ids, other_ids = _report_evidence_ids(report)
+    supplied = set(draft.supporting_evidence_ids)
+    if not supplied or not supplied.intersection(metric_ids) or not supplied.issubset(
+        metric_ids | other_ids
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Draft evidence IDs must include a metric and belong to this report.",
+        )
+    regions = {
+        canonical_region(str(item.get("query_parameters", {}).get("region", "")))
+        for item in report.get("statistical_facts", [])
+    }
+    if regions and canonical_region(draft.region) not in regions:
+        raise HTTPException(
+            status_code=422,
+            detail="Draft region must match the verified metric evidence.",
+        )
+
+
+def _update_thread_report(
+    agent: InvestigationAgent,
+    thread_id: str,
+    updates: dict[str, Any],
+) -> dict[str, Any] | None:
+    config = {"configurable": {"thread_id": thread_id}}
+    snapshot = agent.graph.get_state(config)
+    if not snapshot or not snapshot.values or not snapshot.values.get("report"):
+        return None
+    report = dict(snapshot.values["report"])
+    report.update(updates)
+    update: dict[str, Any] = {"report": report}
+    history = list(snapshot.values.get("history", []))
+    assistant_index = next(
+        (
+            index
+            for index in range(len(history) - 1, -1, -1)
+            if getattr(history[index], "type", "") in {"ai", "assistant"}
+        ),
+        None,
+    )
+    if assistant_index is not None:
+        assistant_message = history[assistant_index]
+        content = str(report.get("summary") or getattr(assistant_message, "content", ""))
+        status = report.get("action_status")
+        if status == "awaiting_approval":
+            suffix = " 已生成一份待人工审批的工单草稿；尚未执行任何业务写入。"
+        elif status == "executed":
+            result = report.get("action_result") or {}
+            ticket_id = result.get("ticket_id") if isinstance(result, dict) else None
+            suffix = " 工单已批准并创建。"
+            if ticket_id:
+                suffix = f" 工单已批准并创建，工单 ID：{ticket_id}。"
+        elif status == "rejected":
+            suffix = " 工单草稿已拒绝，未创建工单。"
+        elif status == "action_failed":
+            suffix = " 工单执行失败；未确认业务写入。"
+        else:
+            suffix = ""
+        if suffix:
+            history[assistant_index] = assistant_message.model_copy(
+                update={"content": content + suffix}
+            )
+            update["history"] = [history[assistant_index]]
+    agent.graph.update_state(config, update)
+    return report
 
 
 def create_app(
@@ -209,18 +304,60 @@ def create_app(
         state = snapshot.values if snapshot and snapshot.values else {}
         history = [_message_to_dict(item) for item in state.get("history", [])]
         pending_approvals = []
+        latest_approval = None
         if application.state.action_store:
-            pending_approvals = await asyncio.to_thread(
+            all_approvals = await asyncio.to_thread(
                 application.state.action_store.list_for_thread, thread_id
             )
-            pending_approvals = [
-                item for item in pending_approvals if item.get("status") == "pending"
-            ]
+            pending_approvals = [item for item in all_approvals if item.get("status") == "pending"]
             workflow = ApprovalWorkflow(
                 application.state.checkpointer, application.state.action_store
             )
             for approval in pending_approvals:
                 await asyncio.to_thread(workflow.ensure_pending_interrupt, approval)
+            latest = all_approvals[0] if all_approvals else None
+            latest_approval = latest
+            if pending_approvals and state.get("report"):
+                latest_pending = pending_approvals[0]
+                await asyncio.to_thread(
+                    _update_thread_report,
+                    current_agent,
+                    thread_id,
+                    {
+                        "action_status": "awaiting_approval",
+                        "approval_id": str(latest_pending["approval_id"]),
+                        "action_proposal": latest_pending.get("action_payload"),
+                        "action_result": None,
+                    },
+                )
+                snapshot = await asyncio.to_thread(
+                    current_agent.graph.get_state,
+                    {"configurable": {"thread_id": thread_id}},
+                )
+                state = snapshot.values if snapshot and snapshot.values else {}
+            if (
+                not pending_approvals
+                and latest
+                and latest.get("status") in {"executed", "rejected"}
+                and state.get("report")
+            ):
+                status = str(latest["status"])
+                await asyncio.to_thread(
+                    _update_thread_report,
+                    current_agent,
+                    thread_id,
+                    {
+                        "action_status": status,
+                        "approval_id": str(latest["approval_id"]),
+                        "action_result": latest.get("execution_result") or {"status": status},
+                    },
+                )
+                snapshot = await asyncio.to_thread(
+                    current_agent.graph.get_state,
+                    {"configurable": {"thread_id": thread_id}},
+                )
+                state = snapshot.values if snapshot and snapshot.values else {}
+        history = [_message_to_dict(item) for item in state.get("history", [])]
         thread_status = (
             "awaiting_approval"
             if pending_approvals
@@ -236,6 +373,8 @@ def create_app(
             "report": state.get("report"),
             "status": thread_status,
             "pending_approvals": pending_approvals,
+            "latest_approval": latest_approval,
+            "event_cursor": events.latest_event_id(thread_id),
             "next": list(snapshot.next) if snapshot else [],
         }
 
@@ -246,6 +385,14 @@ def create_app(
             raise HTTPException(status_code=404, detail="Thread not found.")
         lock = application.state.thread_locks.for_thread(thread_id)
         async with lock:
+            action_store = application.state.action_store
+            if action_store:
+                approvals = await asyncio.to_thread(action_store.list_for_thread, thread_id)
+                if any(item.get("status") == "pending" for item in approvals):
+                    raise HTTPException(
+                        status_code=409,
+                        detail="This thread has a pending action; decide or revise it first.",
+                    )
             snapshot = await asyncio.to_thread(
                 current_agent.graph.get_state,
                 {"configurable": {"thread_id": thread_id}},
@@ -267,7 +414,51 @@ def create_app(
                     )
                     if thread_agent is None:
                         raise RuntimeError("Live model credentials are not configured.")
-                    return thread_agent.investigate(request.question, thread_id=thread_id)
+                    report = thread_agent.investigate(request.question, thread_id=thread_id)
+                    if report.action_proposal:
+                        if not application.state.action_store:
+                            report = report.model_copy(
+                                update={"action_status": "action_failed", "approval_id": None}
+                            )
+                        else:
+                            draft = report.action_proposal
+                            approval = action_store.create_pending(thread_id, draft)
+                            if approval.get("status") == "pending":
+                                workflow = ApprovalWorkflow(
+                                    checkpointer, application.state.action_store
+                                )
+                                workflow.ensure_pending_interrupt(approval)
+                                report = report.model_copy(
+                                    update={
+                                        "action_status": "awaiting_approval",
+                                        "approval_id": str(approval["approval_id"]),
+                                        "action_result": None,
+                                    }
+                                )
+                                events.publish(
+                                    thread_id,
+                                    "approval_required",
+                                    {
+                                        "approval_id": approval["approval_id"],
+                                        "status": "pending",
+                                        "draft": approval["action_payload"],
+                                        "evidence_ids": draft.supporting_evidence_ids,
+                                    },
+                                )
+                            else:
+                                report = report.model_copy(
+                                    update={
+                                        "action_status": str(approval.get("status")),
+                                        "approval_id": str(approval["approval_id"]),
+                                        "action_result": approval.get("execution_result"),
+                                    }
+                                )
+                    if report.action_proposal:
+                        thread_agent.graph.update_state(
+                            {"configurable": {"thread_id": thread_id}},
+                            {"report": report.model_dump(mode="json")},
+                        )
+                    return report
                 except Exception as error:
                     events.publish(thread_id, "error", {"code": "THREAD_INVESTIGATION_FAILED"})
                     raise HTTPException(
@@ -328,13 +519,14 @@ def create_app(
     async def thread_events(
         thread_id: str,
         last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        after: str | None = None,
     ):
         _, registry, _ = require_thread_services()
         if await asyncio.to_thread(registry.get, thread_id) is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
 
         async def generate():
-            async for item in events.stream(thread_id, last_event_id):
+            async for item in events.stream(thread_id, last_event_id or after):
                 yield format_sse(item)
 
         return StreamingResponse(
@@ -357,28 +549,49 @@ def create_app(
             )
             state = snapshot.values if snapshot and snapshot.values else {}
             report = state.get("report") or {}
-            if not report.get("investigation_id") or not report.get("statistical_facts"):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "A completed evidence-backed investigation is required "
-                        "before ticket approval."
-                    ),
-                )
-            if request.draft.source_investigation_id != report["investigation_id"]:
-                raise HTTPException(
-                    status_code=422,
-                    detail="Draft must reference the latest investigation.",
-                )
+            _validate_ticket_draft(request.draft, report)
 
             def create_and_pause() -> dict[str, Any]:
-                approval = action_store.create_pending(thread_id, request.draft)
+                existing = [
+                    item
+                    for item in action_store.list_for_thread(thread_id)
+                    if item.get("status") == "pending"
+                ]
+                if len(existing) > 1:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Multiple pending actions exist; resolve the thread before editing.",
+                    )
+                if existing:
+                    current = existing[0]
+                    if current.get("action_payload") == request.draft.model_dump(mode="json"):
+                        approval = current
+                    else:
+                        approval = action_store.revise_pending(
+                            str(current["approval_id"]),
+                            str(current["payload_hash"]),
+                            request.draft,
+                        )
+                else:
+                    approval = action_store.create_pending(thread_id, request.draft)
                 if approval.get("status") == "pending":
                     workflow = ApprovalWorkflow(checkpointer, action_store)
                     workflow.ensure_pending_interrupt(approval)
                 return approval
 
             approval = await asyncio.to_thread(create_and_pause)
+            if approval.get("status") == "pending":
+                await asyncio.to_thread(
+                    _update_thread_report,
+                    current_agent,
+                    thread_id,
+                    {
+                        "action_proposal": request.draft.model_dump(mode="json"),
+                        "action_status": "awaiting_approval",
+                        "approval_id": str(approval["approval_id"]),
+                        "action_result": None,
+                    },
+                )
             event_name = (
                 "approval_required" if approval.get("status") == "pending" else "status"
             )
@@ -389,9 +602,7 @@ def create_app(
                     "approval_id": approval["approval_id"],
                     "status": approval["status"],
                     "draft": approval["action_payload"],
-                    "evidence_ids": [
-                        item["evidence_id"] for item in report.get("statistical_facts", [])
-                    ],
+                    "evidence_ids": request.draft.supporting_evidence_ids,
                 },
             )
             return approval
@@ -425,7 +636,7 @@ def create_app(
 
     @application.post("/api/v1/threads/{thread_id}/approvals/{approval_id}/decision")
     async def decide_approval(thread_id: str, approval_id: str, decision: ApprovalDecision):
-        checkpointer, registry, _ = require_thread_services()
+        checkpointer, registry, current_agent = require_thread_services()
         action_store = require_action_store(checkpointer)
         if await asyncio.to_thread(registry.get, thread_id) is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
@@ -453,10 +664,23 @@ def create_app(
                     detail="Approval could not be resumed; its stored payload was not changed.",
                 ) from error
             final = result.get("result", {})
+            final_status = str(final.get("status", "action_failed"))
+            if final_status not in {"executed", "rejected"}:
+                final_status = "action_failed"
+            await asyncio.to_thread(
+                _update_thread_report,
+                current_agent,
+                thread_id,
+                {
+                    "action_status": final_status,
+                    "approval_id": approval_id,
+                    "action_result": final,
+                },
+            )
             events.publish(
                 thread_id,
                 "status",
-                {"status": final.get("status", "unknown"), "approval_id": approval_id},
+                {"status": final_status, "approval_id": approval_id},
             )
             return final
 

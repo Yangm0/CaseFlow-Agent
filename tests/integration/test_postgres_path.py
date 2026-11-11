@@ -4,12 +4,13 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi.testclient import TestClient
+from langchain_core.messages import AIMessage
 from sqlalchemy import delete, func, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 
 from caseflow.agent import OfflineFakeModel, build_agent
-from caseflow.api import create_app
+from caseflow.api import _update_thread_report, create_app
 from caseflow.config import Settings
 from caseflow.data.seed import seed_database
 from caseflow.models import Document, PaymentAttempt
@@ -167,6 +168,7 @@ def test_offline_fastapi_investigation_uses_postgres_and_bm25(postgres_engines):
         json={
             "question": (
                 "北京 2025-01-21 09:00 到 12:00 支付失败率是否异常？请查询相关变更和知识文档。"
+                "如果需要处理，帮我创建一个高优先级工单。"
             )
         },
     )
@@ -198,3 +200,51 @@ def test_offline_fastapi_investigation_uses_postgres_and_bm25(postgres_engines):
         for citation in hypothesis["citations"]
     )
     assert report["trace_id"] and "因果" in report["summary"]
+    draft = report["action_proposal"]
+    assert report["action_status"] == "action_proposed"
+    assert draft["priority"] == "high" and draft["region"] == "北京"
+    assert draft["source_investigation_id"] == report["investigation_id"]
+    assert draft["rationale"] and draft["supporting_evidence_ids"]
+    valid_evidence_ids = {
+        report["statistical_facts"][0]["evidence_id"],
+        *(item["evidence_id"] for item in report["document_evidence"]),
+        *(item["evidence_id"] for item in report["system_events"]),
+    }
+    assert set(draft["supporting_evidence_ids"]).issubset(valid_evidence_ids)
+
+    class RecordingGraph:
+        def __init__(self):
+            self.values = {
+                "report": report,
+                "history": [
+                    AIMessage(
+                        id="assistant-report",
+                        content=(
+                            f"{report['summary']} 已生成一份待人工审批的工单草稿；"
+                            "尚未执行任何业务写入。"
+                        ),
+                    )
+                ],
+            }
+
+        def get_state(self, config):
+            return type("Snapshot", (), {"values": self.values})()
+
+        def update_state(self, config, updates):
+            self.values.update({key: value for key, value in updates.items() if key != "history"})
+            if "history" in updates:
+                self.values["history"] = [updates["history"][0]]
+
+    graph = RecordingGraph()
+    agent_stub = type("AgentStub", (), {"graph": graph})()
+    terminal_update = {
+        "action_status": "executed",
+        "approval_id": "approval-smoke",
+        "action_result": {"status": "executed", "ticket_id": "ticket-smoke"},
+    }
+    _update_thread_report(agent_stub, "thread-smoke", terminal_update)
+    first_content = graph.values["history"][-1].content
+    assert "工单已批准并创建，工单 ID：ticket-smoke" in first_content
+    assert "待人工审批" not in first_content
+    _update_thread_report(agent_stub, "thread-smoke", terminal_update)
+    assert graph.values["history"][-1].content.count("工单 ID：ticket-smoke") == 1

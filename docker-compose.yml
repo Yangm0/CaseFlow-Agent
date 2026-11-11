@@ -33,8 +33,11 @@ services:
       DATABASE_URL: postgresql+psycopg://${CASEFLOW_APP_USER:-caseflow_app}:${CASEFLOW_APP_PASSWORD:-caseflow_app_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
       CASEFLOW_MCP_HOST: 0.0.0.0
       CASEFLOW_MCP_PORT: 8001
+      EMBEDDING_CACHE_DIR: /app/.tmp/fastembed_cache
     ports:
       - "127.0.0.1:${CASEFLOW_MCP_HOST_PORT:-8001}:8001"
+    volumes:
+      - caseflow_embedding_cache:/app/.tmp/fastembed_cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -54,8 +57,11 @@ services:
       ACTION_EXECUTOR_DATABASE_URL: postgresql+psycopg://caseflow_action_executor:${CASEFLOW_ACTION_PASSWORD:-caseflow_action_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
       EMBEDDING_INDEX_DATABASE_URL: postgresql+psycopg://caseflow_embedding_indexer:${CASEFLOW_EMBEDDING_INDEX_PASSWORD:-caseflow_embedding_index_dev}@postgres:5432/${CASEFLOW_DATABASE_NAME:-caseflow}
       CASEFLOW_MCP_SERVER_URL: http://mcp:8001/mcp
+      EMBEDDING_CACHE_DIR: /app/.tmp/fastembed_cache
     ports:
       - "127.0.0.1:${CASEFLOW_API_HOST_PORT:-8000}:8000"
+    volumes:
+      - caseflow_embedding_cache:/app/.tmp/fastembed_cache
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,3 +75,4 @@ services:
 
 volumes:
   caseflow_pgdata:
+  caseflow_embedding_cache:

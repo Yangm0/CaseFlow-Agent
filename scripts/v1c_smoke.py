@@ -254,6 +254,8 @@ def _approval_smoke(settings, app_engine) -> dict[str, object]:
         priority="low",
         region="北京",
         source_investigation_id=f"smoke-{smoke_tag}",
+        supporting_evidence_ids=[f"METRIC-{smoke_tag}"],
+        rationale="合成指标高于对照基线，需要值班人员复核。",
     )
     results: dict[str, object] = {"smoke_tag": smoke_tag}
     try:
@@ -273,6 +275,31 @@ def _approval_smoke(settings, app_engine) -> dict[str, object]:
             raise AssertionError("Tampered approval payload hash was accepted.")
         if store.get(rejected["approval_id"])["status"] != "pending":
             raise AssertionError("Tampered hash changed the pending approval state.")
+
+        edited_draft = draft.model_copy(
+            update={"title": "V1-C 修改后的审批草稿", "priority": "medium"}
+        )
+        previous_id = str(rejected["approval_id"])
+        rejected = store.revise_pending(
+            previous_id,
+            str(rejected["payload_hash"]),
+            edited_draft,
+        )
+        if (
+            str(rejected["approval_id"]) == previous_id
+            or rejected["payload_hash"] == duplicate["payload_hash"]
+            or store.get(previous_id)["status"] != "superseded"
+        ):
+            raise AssertionError(
+                "Editing a pending draft did not invalidate the previous approval."
+            )
+        try:
+            store.approve_and_execute(previous_id, str(duplicate["payload_hash"]))
+        except Exception:
+            results["superseded_payload_cannot_execute"] = True
+        else:
+            raise AssertionError("A superseded payload unexpectedly remained executable.")
+        results["edited_payload_has_new_approval_and_hash"] = True
 
         with open_checkpointer(
             _test_url(settings.test_checkpoint_database_url, "TEST_CHECKPOINT_DATABASE_URL")

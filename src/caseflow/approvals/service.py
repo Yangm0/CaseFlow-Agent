@@ -1,30 +1,15 @@
 from __future__ import annotations
 
 import json
-from typing import Annotated, Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, StringConstraints
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from caseflow.db import make_engine
-
-TicketPriority = Literal["low", "medium", "high"]
-
-
-class TicketDraft(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    title: Annotated[str, StringConstraints(strip_whitespace=True, min_length=4, max_length=180)]
-    description: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=10, max_length=4000)
-    ]
-    priority: TicketPriority
-    region: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=40)]
-    source_investigation_id: Annotated[
-        str, StringConstraints(strip_whitespace=True, min_length=1, max_length=80)
-    ]
+from caseflow.schemas import TicketDraft
 
 
 class ApprovalRequest(BaseModel):
@@ -65,6 +50,29 @@ class ActionStore:
                     "approval_id": approval_id,
                     "thread_id": thread_id,
                     "payload": json.dumps(payload, ensure_ascii=False),
+                },
+            ).scalar_one()
+        return dict(result)
+
+    def revise_pending(
+        self,
+        approval_id: str,
+        expected_payload_hash: str,
+        draft: TicketDraft,
+    ) -> dict[str, Any]:
+        """Atomically supersede an edited pending draft and bind a new interrupt payload."""
+        with self.engine.begin() as connection:
+            result = connection.execute(
+                text(
+                    "SELECT caseflow_actions.revise_pending_approval("
+                    "CAST(:approval_id AS uuid), :expected_payload_hash, "
+                    "CAST(:new_approval_id AS uuid), CAST(:payload AS jsonb))"
+                ),
+                {
+                    "approval_id": approval_id,
+                    "expected_payload_hash": expected_payload_hash,
+                    "new_approval_id": str(uuid4()),
+                    "payload": json.dumps(_payload(draft), ensure_ascii=False),
                 },
             ).scalar_one()
         return dict(result)

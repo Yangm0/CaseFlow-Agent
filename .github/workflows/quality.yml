@@ -1,6 +1,10 @@
-name: Manual quality and PostgreSQL integration
+name: Quality and PostgreSQL integration
 
 on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -28,8 +32,6 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
-        volumes:
-          - ${{ github.workspace }}/docker/postgres/init:/docker-entrypoint-initdb.d:ro
     env:
       CASEFLOW_MODE: offline_test
       DATABASE_URL: postgresql+psycopg://caseflow_app:caseflow_app_dev@127.0.0.1:5432/caseflow
@@ -38,6 +40,22 @@ jobs:
       TEST_SEED_DATABASE_URL: postgresql+psycopg://caseflow_seed:caseflow_seed_dev@127.0.0.1:5432/caseflow_test
     steps:
       - uses: actions/checkout@v4
+      - name: Initialize isolated PostgreSQL service
+        run: |
+          container_id="$(docker ps --filter ancestor=pgvector/pgvector:pg17 --format '{{.ID}}' | head -n 1)"
+          test -n "$container_id"
+          docker cp docker/postgres/init/01-create-roles.sh "$container_id:/tmp/01-create-roles.sh"
+          docker exec "$container_id" sh /tmp/01-create-roles.sh
+          docker cp migrations "$container_id:/tmp/migrations"
+          for database in caseflow caseflow_test; do
+            for migration in 001_v1c_approvals.sql 002_v1c_pgvector.sql 003_v1d_pending_draft_revision.sql; do
+              docker exec "$container_id" psql -v ON_ERROR_STOP=1 -U caseflow_admin -d "$database" \
+                -v checkpoint_password=caseflow_checkpoint_dev \
+                -v action_password=caseflow_action_dev \
+                -v embedding_password=caseflow_embedding_index_dev \
+                -f "/tmp/migrations/$migration"
+            done
+          done
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"

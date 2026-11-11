@@ -9,6 +9,6 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 COPY web ./web
-RUN python -m pip install --no-cache-dir .
+RUN python -m pip install --no-cache-dir ".[local-embedding]"
 
 EXPOSE 8000 8001

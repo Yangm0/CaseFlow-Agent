@@ -50,11 +50,14 @@
           <label>地区<input id="ticket-region" required maxlength="40" value="北京" /></label>
           <label>优先级<select id="ticket-priority"><option value="high">高</option><option value="medium">中</option><option value="low">低</option></select></label>
           <label class="wide">描述<textarea id="ticket-description" required minlength="10" maxlength="4000" rows="4"></textarea></label>
-          <div class="wide approval-actions"><button type="submit">提交待审批草稿</button></div>
+          <label class="wide">处理依据<textarea id="ticket-rationale" required minlength="8" maxlength="1200" rows="3"></textarea></label>
+          <label class="wide">支持证据 ID（逗号分隔）<textarea id="ticket-evidence" required rows="2"></textarea></label>
+          <div class="wide approval-actions"><button id="submit-draft" type="submit">提交待审批草稿</button></div>
         </form>
         <div id="pending-approval" class="hidden">
           <div id="approval-details"></div>
           <div class="approval-actions">
+            <button id="edit-ticket" class="secondary">修改草稿</button>
             <button id="approve-ticket">批准并创建</button>
             <button id="reject-ticket" class="danger">拒绝</button>
           </div>
@@ -63,6 +66,6 @@
       </section>
       <footer>本地演示界面 · 尚无用户认证，不适合直接暴露到公网。</footer>
     </main>
-    <script src="/web/app.js?v=v1c-approval-state" defer></script>
+<script src="/web/app.js?v=v1d-event-cursor" defer></script>
   </body>
 </html>
