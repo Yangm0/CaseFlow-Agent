@@ -39,6 +39,11 @@ class ThreadEventHub:
             loop.call_soon_threadsafe(self._offer, queue, item)
         return item
 
+    def latest_event_id(self, thread_id: str) -> str | None:
+        with self._lock:
+            history = self._history.get(thread_id)
+            return history[-1]["id"] if history else None
+
     @staticmethod
     def _offer(queue: asyncio.Queue, item: dict[str, Any]) -> None:
         if queue.full():

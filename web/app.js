@@ -89,9 +89,10 @@
       $("approval-form").classList.remove("hidden");
     }
   };
-  const connectEvents = (threadId) => {
+  const connectEvents = (threadId, afterEventId = null) => {
     if (state.eventSource) state.eventSource.close();
-    const source = new EventSource(`/api/v1/threads/${threadId}/events`);
+    const cursor = afterEventId ? `?after=${encodeURIComponent(afterEventId)}` : "";
+    const source = new EventSource(`/api/v1/threads/${threadId}/events${cursor}`);
     state.eventSource = source;
     source.onopen = () => { $("connection-state").textContent = "实时连接"; };
     source.onerror = () => { $("connection-state").textContent = "重连中"; };
@@ -272,7 +273,6 @@
   if (savedThreadId) {
     state.threadId = savedThreadId;
     $("thread-id").textContent = savedThreadId;
-    connectEvents(savedThreadId);
     request(`/api/v1/threads/${savedThreadId}`).then((thread) => {
       $("messages").replaceChildren();
       for (const item of thread.messages || []) message(item.role, item.content);
@@ -301,6 +301,7 @@
           evidence_ids: thread.latest_approval.action_payload.supporting_evidence_ids || [],
         });
       }
+      connectEvents(savedThreadId, thread.event_cursor);
     }).catch((error) => {
       activity("无法恢复上次会话", error.message);
       localStorage.removeItem("caseflow-thread-id");

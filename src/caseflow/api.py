@@ -374,6 +374,7 @@ def create_app(
             "status": thread_status,
             "pending_approvals": pending_approvals,
             "latest_approval": latest_approval,
+            "event_cursor": events.latest_event_id(thread_id),
             "next": list(snapshot.next) if snapshot else [],
         }
 
@@ -518,13 +519,14 @@ def create_app(
     async def thread_events(
         thread_id: str,
         last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+        after: str | None = None,
     ):
         _, registry, _ = require_thread_services()
         if await asyncio.to_thread(registry.get, thread_id) is None:
             raise HTTPException(status_code=404, detail="Thread not found.")
 
         async def generate():
-            async for item in events.stream(thread_id, last_event_id):
+            async for item in events.stream(thread_id, last_event_id or after):
                 yield format_sse(item)
 
         return StreamingResponse(

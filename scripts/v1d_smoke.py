@@ -199,6 +199,10 @@ def main() -> int:
             response.raise_for_status()
             report = response.json()
             call_order = _assert_report(report)
+            restored_state = client.get(f"/api/v1/threads/{thread_id}")
+            restored_state.raise_for_status()
+            if not restored_state.json().get("event_cursor"):
+                raise AssertionError("The thread did not expose its latest SSE replay cursor.")
             if report.get("action_status") != "awaiting_approval":
                 raise AssertionError("The Agent proposal did not create a pending approval.")
             pending = client.get(f"/api/v1/threads/{thread_id}/approvals")
